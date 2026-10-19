@@ -12,9 +12,12 @@
     "lint:eslint": "eslint . --fix --cache"
   },
   "dependencies": {
+    "@inteye/llm-hub": "^1.0.4",
+    "@inteye/llm-hub-ui": "^1.0.2",
     "pinia": "^4.0.3",
     "vue": "^3.5.42",
-    "vue-router": "^5.3.1"
+    "vue-router": "^5.3.1",
+    "zen-ai-chat-ui": "0.1.0-beta.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
