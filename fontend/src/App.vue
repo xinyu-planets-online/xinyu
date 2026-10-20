@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watchEffect } from 'vue'
 import { ChatContainer, useStreaming, uid } from 'zen-ai-chat-ui'
 import 'zen-ai-chat-ui/style.css'
 
@@ -64,6 +64,14 @@ onUnmounted(() => {
   document.removeEventListener('llm-hub-select', onLLMHubSelect)
   mql?.removeEventListener('change', onSchemeChange)
   clearTimeout(noticeTimer)
+})
+
+watchEffect(() => {
+  const theme = resolvedTheme.value
+  document.documentElement.setAttribute('data-theme', theme)
+  document.body.setAttribute('data-theme', theme)
+  document.documentElement.style.colorScheme = theme
+  document.body.style.colorScheme = theme
 })
 
 const presetQuestions = [
@@ -209,123 +217,158 @@ async function onSend({ text }) {
   height: 100%;
 }
 
-/* ============================================================
-   亮色：--acu-* 与 --llm-hub-* 并列直写
-   ============================================================ */
+/* ============ 亮色令牌 + --llm-hub-* 映射（使用 light-dark） ============ */
 :global(:root),
 :global([data-theme='light']) {
   color-scheme: light;
 
-  /* zen-ai-chat-ui */
-  --acu-bg: #f8f0e4;
-  --acu-surface: #f3e8d7;
-  --acu-surface-2: #ecdfcc;
-  --acu-surface-hover: #efe3d1;
-  --acu-text: #453b32;
-  --acu-text-secondary: #6b5d4d;
-  --acu-text-muted: #a09078;
-  --acu-border: rgba(165, 107, 69, 0.18);
-  --acu-border-strong: rgba(165, 107, 69, 0.32);
-  --acu-primary: #a56b45;
-  --acu-primary-hover: #8f5a38;
-  --acu-primary-active: #7a4a2d;
-  --acu-primary-contrast: #fffaf3;
-  --acu-primary-soft: rgba(165, 107, 69, 0.1);
-  --acu-primary-soft-hover: rgba(165, 107, 69, 0.16);
-  --acu-bubble-user-bg: #a56b45;
-  --acu-bubble-user-text: #fffaf3;
-  --acu-bubble-assistant-bg: #fffcf6;
-  --acu-bubble-assistant-text: #453b32;
-  --acu-thinking-bg: #f5ead8;
-  --acu-thinking-text: #8a7962;
-  --acu-thinking-border: rgba(165, 107, 69, 0.14);
-  --acu-thinking-icon: #a09078;
-  --acu-code-bg: #f3e8d7;
-  --acu-code-text: #453b32;
-  --acu-code-border: rgba(165, 107, 69, 0.18);
-  --acu-code-inline-bg: rgba(165, 107, 69, 0.12);
-  --acu-code-header-bg: #ecdfcc;
+  --surface-0: #f2e9dc;
+  --surface-1: #f8f0e4;
+  --surface-2: #f3e8d7;
+  --surface-3: #ecdfcc;
+
+  --text-1: #453b32;
+  --text-2: #6b5d4d;
+  --text-3: #a09078;
+
+  --border-1: rgba(165, 107, 69, 0.14);
+  --border-2: rgba(165, 107, 69, 0.2);
+  --border-3: rgba(165, 107, 69, 0.34);
+
+  --accent: #a56b45;
+  --accent-hover: #8f5a38;
+  --accent-soft: rgba(165, 107, 69, 0.1);
+  --accent-soft-hover: rgba(165, 107, 69, 0.16);
+  --accent-contrast: #fffaf3;
+
+  --shadow-sm: 0 0.0625rem 0.125rem rgba(122, 92, 62, 0.06);
+  --shadow-md: 0 0.25rem 1rem rgba(122, 92, 62, 0.1);
+  --shadow-lg: 0 1.5rem 3.75rem -1.625rem rgba(122, 92, 62, 0.34);
+  --drawer-shadow: -1.5rem 0 4rem -2rem rgba(122, 92, 62, 0.35);
+  --mask: rgba(72, 56, 40, 0.24);
+
+  /* --acu-* 映射 */
+  --acu-bg: var(--surface-1);
+  --acu-surface: var(--surface-2);
+  --acu-surface-2: var(--surface-3);
+  --acu-surface-hover: var(--surface-3);
+  --acu-text: var(--text-1);
+  --acu-text-secondary: var(--text-2);
+  --acu-text-muted: var(--text-3);
+  --acu-border: var(--border-2);
+  --acu-border-strong: var(--border-3);
+  --acu-primary: var(--accent);
+  --acu-primary-hover: var(--accent-hover);
+  --acu-primary-active: var(--accent-hover);
+  --acu-primary-contrast: var(--accent-contrast);
+  --acu-primary-soft: var(--accent-soft);
+  --acu-primary-soft-hover: var(--accent-soft-hover);
+  --acu-bubble-user-bg: var(--accent);
+  --acu-bubble-user-text: var(--accent-contrast);
+  --acu-bubble-assistant-bg: var(--surface-2);
+  --acu-bubble-assistant-text: var(--text-1);
+  --acu-thinking-bg: var(--surface-2);
+  --acu-thinking-text: var(--text-2);
+  --acu-thinking-border: var(--border-1);
+  --acu-thinking-icon: var(--text-3);
+  --acu-code-bg: var(--surface-2);
+  --acu-code-text: var(--text-1);
+  --acu-code-border: var(--border-2);
+  --acu-code-inline-bg: var(--border-1);
+  --acu-code-header-bg: var(--surface-3);
   --acu-error: #c0563f;
   --acu-error-soft: rgba(192, 86, 63, 0.1);
   --acu-success: #6b8f6b;
   --acu-warning: #c08a3e;
-  --acu-shadow-sm: 0 0.0625rem 0.125rem rgba(122, 92, 62, 0.06);
-  --acu-shadow: 0 0.25rem 1rem rgba(122, 92, 62, 0.1);
-  --acu-shadow-lg: 0 1.5rem 3.75rem -1.625rem rgba(122, 92, 62, 0.34);
+  --acu-shadow-sm: var(--shadow-sm);
+  --acu-shadow: var(--shadow-md);
+  --acu-shadow-lg: var(--shadow-lg);
 
-  /* @inteye/llm-hub-ui */
-  --llm-hub-primary: #a56b45;
-  --llm-hub-primary-hover: #8f5a38;
-  --llm-hub-accent: #a56b45;
-  --llm-hub-accent-hover: #8f5a38;
-  --llm-hub-bg: #f8f0e4;
-  --llm-hub-bg-secondary: #f3e8d7;
-  --llm-hub-bg-elevated: #fffcf6;
-  --llm-hub-border: rgba(165, 107, 69, 0.2);
-  --llm-hub-text: #453b32;
-  --llm-hub-text-secondary: #6b5d4d;
+  /* --llm-hub-* 映射：light-dark() 根据 color-scheme 自动选择 */
+  --llm-hub-primary: light-dark(var(--accent), #8fa8c8);
+  --llm-hub-primary-hover: light-dark(var(--accent-hover), #a3bad6);
+  --llm-hub-accent: light-dark(var(--accent), #8fa8c8);
+  --llm-hub-accent-hover: light-dark(var(--accent-hover), #a3bad6);
+
+  --llm-hub-bg: light-dark(var(--surface-1), #15181d);
+  --llm-hub-bg-secondary: light-dark(var(--surface-2), #1b1f25);
+  --llm-hub-bg-elevated: light-dark(var(--surface-3), #1d2229);
+
+  --llm-hub-border: light-dark(var(--border-2), rgba(255, 255, 255, 0.09));
+  --llm-hub-border-strong: light-dark(var(--border-3), rgba(255, 255, 255, 0.18));
+  --llm-hub-text: light-dark(var(--text-1), #e6e9ee);
+  --llm-hub-text-secondary: light-dark(var(--text-2), #a8b0bc);
+  --llm-hub-text-muted: light-dark(var(--text-3), #727a86);
   --llm-hub-radius: 0.625rem;
 }
 
-/* ============================================================
-   深色：--acu-* 与 --llm-hub-* 并列直写
-   ============================================================ */
+/* ============ 深色令牌 ============ */
 :global([data-theme='dark']) {
   color-scheme: dark;
 
-  /* zen-ai-chat-ui */
-  --acu-bg: #15181d;
-  --acu-surface: #1b1f25;
-  --acu-surface-2: #232830;
-  --acu-surface-hover: #282e37;
-  --acu-text: #e6e9ee;
-  --acu-text-secondary: #a8b0bc;
-  --acu-text-muted: #727a86;
-  --acu-border: rgba(255, 255, 255, 0.09);
-  --acu-border-strong: rgba(255, 255, 255, 0.18);
-  --acu-primary: #8fa8c8;
-  --acu-primary-hover: #a3bad6;
-  --acu-primary-active: #b6cbe3;
-  --acu-primary-contrast: #12151a;
-  --acu-primary-soft: rgba(143, 168, 200, 0.14);
-  --acu-primary-soft-hover: rgba(143, 168, 200, 0.2);
-  --acu-bubble-user-bg: #2c3644;
-  --acu-bubble-user-text: #e6e9ee;
-  --acu-bubble-assistant-bg: #1d2229;
-  --acu-bubble-assistant-text: #e6e9ee;
-  --acu-thinking-bg: #1b1f25;
-  --acu-thinking-text: #8f98a6;
-  --acu-thinking-border: rgba(255, 255, 255, 0.08);
-  --acu-thinking-icon: #727a86;
-  --acu-code-bg: #171b21;
-  --acu-code-text: #e6e9ee;
-  --acu-code-border: rgba(255, 255, 255, 0.1);
-  --acu-code-inline-bg: rgba(255, 255, 255, 0.08);
-  --acu-code-header-bg: #232830;
+  --surface-0: #0d1014;
+  --surface-1: #15181d;
+  --surface-2: #1b1f25;
+  --surface-3: #232830;
+
+  --text-1: #e6e9ee;
+  --text-2: #a8b0bc;
+  --text-3: #727a86;
+
+  --border-1: rgba(255, 255, 255, 0.06);
+  --border-2: rgba(255, 255, 255, 0.09);
+  --border-3: rgba(255, 255, 255, 0.18);
+
+  --accent: #8fa8c8;
+  --accent-hover: #a3bad6;
+  --accent-soft: rgba(143, 168, 200, 0.14);
+  --accent-soft-hover: rgba(143, 168, 200, 0.2);
+  --accent-contrast: #12151a;
+
+  --shadow-sm: 0 0.0625rem 0.125rem rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 0.25rem 1rem rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 1.5rem 3.75rem -1.75rem rgba(0, 0, 0, 0.8);
+  --drawer-shadow: -1.5rem 0 4rem -2rem rgba(0, 0, 0, 0.7);
+  --mask: rgba(0, 0, 0, 0.55);
+
+  --acu-bg: var(--surface-1);
+  --acu-surface: var(--surface-2);
+  --acu-surface-2: var(--surface-3);
+  --acu-surface-hover: var(--surface-3);
+  --acu-text: var(--text-1);
+  --acu-text-secondary: var(--text-2);
+  --acu-text-muted: var(--text-3);
+  --acu-border: var(--border-2);
+  --acu-border-strong: var(--border-3);
+  --acu-primary: var(--accent);
+  --acu-primary-hover: var(--accent-hover);
+  --acu-primary-active: var(--accent-hover);
+  --acu-primary-contrast: var(--accent-contrast);
+  --acu-primary-soft: var(--accent-soft);
+  --acu-primary-soft-hover: var(--accent-soft-hover);
+  --acu-bubble-user-bg: var(--accent);
+  --acu-bubble-user-text: var(--accent-contrast);
+  --acu-bubble-assistant-bg: var(--surface-2);
+  --acu-bubble-assistant-text: var(--text-1);
+  --acu-thinking-bg: var(--surface-2);
+  --acu-thinking-text: var(--text-2);
+  --acu-thinking-border: var(--border-1);
+  --acu-thinking-icon: var(--text-3);
+  --acu-code-bg: var(--surface-2);
+  --acu-code-text: var(--text-1);
+  --acu-code-border: var(--border-2);
+  --acu-code-inline-bg: var(--border-1);
+  --acu-code-header-bg: var(--surface-3);
   --acu-error: #e07a7a;
   --acu-error-soft: rgba(224, 122, 122, 0.14);
   --acu-success: #7fbf9f;
   --acu-warning: #d4b06a;
-  --acu-shadow-sm: 0 0.0625rem 0.125rem rgba(0, 0, 0, 0.35);
-  --acu-shadow: 0 0.25rem 1rem rgba(0, 0, 0, 0.45);
-  --acu-shadow-lg: 0 1.5rem 3.75rem -1.75rem rgba(0, 0, 0, 0.8);
-
-  /* @inteye/llm-hub-ui */
-  --llm-hub-primary: #8fa8c8;
-  --llm-hub-primary-hover: #a3bad6;
-  --llm-hub-accent: #8fa8c8;
-  --llm-hub-accent-hover: #a3bad6;
-  --llm-hub-bg: #15181d;
-  --llm-hub-bg-secondary: #1b1f25;
-  --llm-hub-bg-elevated: #1d2229;
-  --llm-hub-border: rgba(255, 255, 255, 0.09);
-  --llm-hub-text: #e6e9ee;
-  --llm-hub-text-secondary: #a8b0bc;
+  --acu-shadow-sm: var(--shadow-sm);
+  --acu-shadow: var(--shadow-md);
+  --acu-shadow-lg: var(--shadow-lg);
 }
 
-/* ============================================================
-   页面外壳
-   ============================================================ */
+/* ============ 页面 ============ */
 .page {
   --glow-a: rgba(255, 206, 166, 0.78);
   --glow-b: rgba(255, 198, 186, 0.66);
@@ -358,9 +401,7 @@ async function onSend({ text }) {
   --glow-c: rgba(36, 46, 60, 0.4);
 }
 
-/* ============================================================
-   顶栏
-   ============================================================ */
+/* ============ 顶栏 ============ */
 .topbar {
   flex: 0 0 auto;
   display: flex;
@@ -433,9 +474,7 @@ async function onSend({ text }) {
   border-color: var(--acu-primary-soft);
 }
 
-/* ============================================================
-   提示
-   ============================================================ */
+/* ============ 提示 ============ */
 .notice {
   position: fixed;
   top: clamp(3.25rem, 8vh, 4.25rem);
@@ -476,9 +515,7 @@ async function onSend({ text }) {
   cursor: pointer;
 }
 
-/* ============================================================
-   聊天区
-   ============================================================ */
+/* ============ 聊天区 ============ */
 .chat-area {
   flex: 1 1 auto;
   min-height: 0;
@@ -509,14 +546,12 @@ async function onSend({ text }) {
   min-width: 0;
 }
 
-/* ============================================================
-   遮罩
-   ============================================================ */
+/* ============ 遮罩 ============ */
 .mask {
   position: fixed;
   inset: 0;
   z-index: 40;
-  background: rgba(72, 56, 40, 0.24);
+  background: var(--mask);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.35s ease;
@@ -527,9 +562,7 @@ async function onSend({ text }) {
   pointer-events: auto;
 }
 
-/* ============================================================
-   设置抽屉
-   ============================================================ */
+/* ============ 设置抽屉 ============ */
 .drawer {
   position: fixed;
   top: 0;
@@ -544,13 +577,9 @@ async function onSend({ text }) {
   flex-direction: column;
   background: var(--acu-bg);
   border-left: 0.0625rem solid var(--acu-border);
-  box-shadow: -1.5rem 0 4rem -2rem rgba(122, 92, 62, 0.35);
+  box-shadow: var(--drawer-shadow);
   transform: translateX(105%);
   transition: transform 0.42s cubic-bezier(0.22, 0.8, 0.24, 1);
-}
-
-.page[data-theme='dark'] .drawer {
-  box-shadow: -1.5rem 0 4rem -2rem rgba(0, 0, 0, 0.7);
 }
 
 .drawer.show {
@@ -779,9 +808,7 @@ async function onSend({ text }) {
   background: var(--acu-primary-hover);
 }
 
-/* ============================================================
-   过渡与响应式
-   ============================================================ */
+/* ============ 过渡与响应式 ============ */
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.35s ease, transform 0.35s ease;
