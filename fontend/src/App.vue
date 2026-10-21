@@ -14,6 +14,7 @@ const messages = ref([])
 const streaming = useStreaming()
 
 const configEl = ref(null)
+const fileInputEl = ref(null)
 
 const appName = ref('')
 const assistantName = ref('AI 助手')
@@ -21,7 +22,6 @@ const assistantName = ref('AI 助手')
 const currentProvider = ref('')
 const currentModel = ref('')
 
-  // 读回上次选择的 provider / model
   ; (() => {
     try {
       const raw = localStorage.getItem(SELECTION_KEY)
@@ -119,6 +119,7 @@ function makeTitleFromText(text) {
 }
 
 function createConversation() {
+  if (selectMode.value) cancelSelectMode()
   const id = uid('conv')
   const conv = {
     id,
@@ -203,6 +204,7 @@ function persist() {
       localStorage.setItem(STORAGE_KEY + ':active', activeConversationId.value)
     } catch (e) {
       console.warn('[persist] 保存失败', e)
+      showNotice('保存失败：浏览器存储空间可能已满')
     }
   }, 300)
 }
@@ -229,6 +231,174 @@ function loadConversations() {
   } catch (e) {
     console.warn('[loadConversations] 读取失败', e)
     return false
+  }
+}
+
+// ================= 导入导出 =================
+const selectMode = ref(false)
+const selectedIds = ref([])
+
+function enterSelectMode() {
+  if (!conversations.value.length) {
+    showNotice('当前没有可选择的对话')
+    return
+  }
+  selectMode.value = true
+  selectedIds.value = []
+}
+
+function cancelSelectMode() {
+  selectMode.value = false
+  selectedIds.value = []
+}
+
+function toggleSelect(id) {
+  const idx = selectedIds.value.indexOf(id)
+  if (idx >= 0) {
+    selectedIds.value.splice(idx, 1)
+  } else {
+    selectedIds.value.push(id)
+  }
+}
+
+function toggleSelectAll() {
+  if (selectedIds.value.length === conversations.value.length) {
+    selectedIds.value = []
+  } else {
+    selectedIds.value = conversations.value.map(c => c.id)
+  }
+}
+
+function isEmptyConversation(c) {
+  if (!c || !Array.isArray(c.messages) || c.messages.length === 0) return true
+  return c.messages.every(m => {
+    if (!m) return true
+    const content = m.content
+    if (!content) return true
+    return typeof content === 'string' && content.trim() === ''
+  })
+}
+
+function exportConversations(list) {
+  try {
+    const source = Array.isArray(list) ? list : conversations.value
+    const target = source.filter(c => !isEmptyConversation(c))
+    const ignored = source.length - target.length
+
+    if (!target.length) {
+      showNotice('没有可导出的对话（空对话已自动忽略）')
+      return false
+    }
+
+    const activeInTarget = target.some(c => c.id === activeConversationId.value)
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      activeConversationId: activeInTarget ? activeConversationId.value : '',
+      conversations: target.map(c => ({
+        id: c.id,
+        title: c.title,
+        updatedAt: c.updatedAt,
+        messages: c.messages,
+      })),
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    a.href = url
+    a.download = `chat-backup-${ts}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    showNotice(`已导出 ${target.length} 个对话${ignored ? `，忽略 ${ignored} 个空对话` : ''}`)
+    return true
+  } catch (e) {
+    console.error('[export] 失败', e)
+    showNotice('导出失败：' + (e?.message || '未知错误'))
+    return false
+  }
+}
+
+function exportAllConversations() {
+  exportConversations()
+}
+
+function exportSelected() {
+  const list = conversations.value.filter(c => selectedIds.value.includes(c.id))
+  if (!list.length) {
+    showNotice('请先勾选要导出的对话')
+    return
+  }
+  if (exportConversations(list)) {
+    cancelSelectMode()
+  }
+}
+
+function triggerImport() {
+  fileInputEl.value?.click()
+}
+
+async function onFileChange(e) {
+  const file = e.target.files?.[0]
+  if (!file) return
+  e.target.value = ''
+
+  try {
+    const text = await file.text()
+    const data = JSON.parse(text)
+    if (!data || !Array.isArray(data.conversations)) {
+      throw new Error('文件格式不正确')
+    }
+
+    const existingIds = new Set(conversations.value.map(c => c.id))
+    let added = 0
+    let skipped = 0
+
+    for (const c of data.conversations) {
+      if (!c || typeof c.id !== 'string' || !Array.isArray(c.messages)) {
+        skipped++
+        continue
+      }
+      if (isEmptyConversation(c)) {
+        skipped++
+        continue
+      }
+      if (existingIds.has(c.id)) {
+        skipped++
+        continue
+      }
+      conversations.value.push({
+        id: c.id,
+        title: typeof c.title === 'string' && c.title ? c.title : '未命名对话',
+        updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+        messages: c.messages,
+      })
+      existingIds.add(c.id)
+      added++
+    }
+
+    conversations.value.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+
+    if (!conversations.value.find(c => c.id === activeConversationId.value)) {
+      const first = conversations.value[0]
+      if (first) {
+        streaming.reset?.()
+        activeConversationId.value = first.id
+        messages.value = first.messages
+      }
+    }
+
+    persist()
+    if (added === 0) {
+      showNotice(`导入完成：没有新对话（${skipped} 个为空、已存在或无效）`)
+    } else {
+      showNotice(`导入完成：新增 ${added} 个${skipped ? `，跳过 ${skipped} 个` : ''}`)
+    }
+  } catch (e) {
+    console.error('[import] 失败', e)
+    showNotice('导入失败：' + (e?.message || '未知错误'))
   }
 }
 
@@ -349,15 +519,67 @@ onUnmounted(() => {
     <div class="body">
       <aside class="conv-sidebar">
         <div class="conv-sidebar-head">
-          <span class="conv-sidebar-title">对话</span>
-          <button class="conv-new-btn" title="新建对话" @click="createConversation">+</button>
+          <span class="conv-sidebar-title">
+            {{ selectMode ? `已选 ${selectedIds.length}` : '对话' }}
+          </span>
+
+          <div v-if="!selectMode" class="conv-sidebar-actions">
+            <button class="conv-icon-btn" title="导出全部对话" @click="exportAllConversations">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 2v8M4.5 6.5L8 10l3.5-3.5M3 12.5h10" stroke="currentColor" stroke-width="1.4"
+                  stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button class="conv-icon-btn" title="选择性导出" @click="enterSelectMode">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M2.5 4.5h7M2.5 8h7M2.5 11.5h7M12 4.5l1.5 1.5L16 3.5" stroke="currentColor" stroke-width="1.4"
+                  stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button class="conv-icon-btn" title="导入对话" @click="triggerImport">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 10V2M4.5 5.5L8 2l3.5 3.5M3 12.5h10" stroke="currentColor" stroke-width="1.4"
+                  stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button class="conv-new-btn" title="新建对话" @click="createConversation">+</button>
+          </div>
+
+          <div v-else class="conv-sidebar-actions">
+            <button class="conv-icon-btn" :title="selectedIds.length === conversations.length ? '取消全选' : '全选'"
+              @click="toggleSelectAll">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="2.5" y="2.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.4" />
+                <path d="M5.5 8l1.8 1.8L10.8 6.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
+                  stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button class="conv-icon-btn" :disabled="!selectedIds.length" :title="`导出选中的 ${selectedIds.length} 个对话`"
+              @click="exportSelected">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 2v8M4.5 6.5L8 10l3.5-3.5M3 12.5h10" stroke="currentColor" stroke-width="1.4"
+                  stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button class="conv-icon-btn" title="取消" @click="cancelSelectMode">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              </svg>
+            </button>
+          </div>
         </div>
+
+        <input ref="fileInputEl" type="file" accept="application/json,.json" style="display:none"
+          @change="onFileChange" />
 
         <div class="conv-tabs">
           <div v-for="conv in conversations" :key="conv.id" class="conv-tab"
-            :class="{ active: conv.id === activeConversationId }" @click="switchConversation(conv.id)">
+            :class="{ active: conv.id === activeConversationId, selected: selectedIds.includes(conv.id) }"
+            @click="selectMode ? toggleSelect(conv.id) : switchConversation(conv.id)">
+            <input v-if="selectMode" type="checkbox" class="conv-checkbox" :checked="selectedIds.includes(conv.id)"
+              @click.stop @change="toggleSelect(conv.id)" />
             <span class="conv-tab-title" :title="conv.title">{{ conv.title }}</span>
-            <button class="conv-tab-close" title="关闭对话" @click.stop="closeConversation(conv.id)">
+            <button v-if="!selectMode" class="conv-tab-close" title="关闭对话" @click.stop="closeConversation(conv.id)">
               ×
             </button>
           </div>
@@ -731,29 +953,75 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.375rem;
   padding: clamp(0.5rem, 1.2vh, 0.75rem) clamp(0.5rem, 1vw, 0.75rem);
   border-bottom: 0.0625rem solid var(--acu-border);
 }
 
 .conv-sidebar-title {
+  flex: 0 0 auto;
   font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--acu-text-muted);
+  white-space: nowrap;
+}
+
+.conv-sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.conv-icon-btn {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  display: grid;
+  place-items: center;
+  color: var(--acu-text-secondary);
+  background: transparent;
+  border: 0.0625rem solid var(--acu-border);
+  border-radius: 0.4375rem;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.conv-icon-btn svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.conv-icon-btn:hover {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+}
+
+.conv-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.conv-icon-btn:disabled:hover {
+  color: var(--acu-text-secondary);
+  background: transparent;
+  border-color: var(--acu-border);
 }
 
 .conv-new-btn {
-  width: 1.75rem;
-  height: 1.75rem;
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
   display: grid;
   place-items: center;
-  font-size: 1.125rem;
+  font-size: 1rem;
   line-height: 1;
   color: var(--acu-text-secondary);
   background: transparent;
   border: 0.0625rem solid var(--acu-border);
-  border-radius: 0.5rem;
+  border-radius: 0.4375rem;
   cursor: pointer;
   transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
@@ -793,6 +1061,19 @@ onUnmounted(() => {
   background: var(--acu-primary-soft);
 }
 
+.conv-tab.selected {
+  background: var(--acu-primary-soft-hover);
+}
+
+.conv-checkbox {
+  flex: 0 0 auto;
+  width: 0.875rem;
+  height: 0.875rem;
+  margin: 0;
+  accent-color: var(--acu-primary);
+  cursor: pointer;
+}
+
 .conv-tab-title {
   flex: 1 1 auto;
   min-width: 0;
@@ -803,7 +1084,8 @@ onUnmounted(() => {
   color: var(--acu-text-secondary);
 }
 
-.conv-tab.active .conv-tab-title {
+.conv-tab.active .conv-tab-title,
+.conv-tab.selected .conv-tab-title {
   color: var(--acu-primary);
   font-weight: 500;
 }
@@ -1172,7 +1454,7 @@ onUnmounted(() => {
   }
 
   .conv-sidebar {
-    width: 11.5rem;
+    width: 12rem;
   }
 }
 
