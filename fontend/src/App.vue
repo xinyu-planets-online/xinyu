@@ -1,10 +1,14 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watchEffect } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ChatContainer, useStreaming, uid } from 'zen-ai-chat-ui'
 import 'zen-ai-chat-ui/style.css'
 
 import '@inteye/llm-hub-ui/element'
 import '@inteye/llm-hub-ui/style.css'
+
+const STORAGE_KEY = 'chat-conversations'
+const THEME_KEY = 'chat-theme-mode'
+const SELECTION_KEY = 'chat-selection'
 
 const messages = ref([])
 const streaming = useStreaming()
@@ -17,7 +21,28 @@ const assistantName = ref('AI 助手')
 const currentProvider = ref('')
 const currentModel = ref('')
 
-const themeMode = ref('auto')
+  // 读回上次选择的 provider / model
+  ; (() => {
+    try {
+      const raw = localStorage.getItem(SELECTION_KEY)
+      if (raw) {
+        const saved = JSON.parse(raw)
+        currentProvider.value = saved.provider || ''
+        currentModel.value = saved.model || ''
+      }
+    } catch { }
+  })()
+
+const themeMode = ref(
+  (() => {
+    try {
+      const saved = localStorage.getItem(THEME_KEY)
+      return saved === 'light' || saved === 'dark' || saved === 'auto' ? saved : 'auto'
+    } catch {
+      return 'auto'
+    }
+  })()
+)
 const systemDark = ref(false)
 let mql = null
 
@@ -36,6 +61,26 @@ function onSchemeChange(e) {
   systemDark.value = e.matches
 }
 
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme)
+  document.body.setAttribute('data-theme', theme)
+  document.documentElement.style.colorScheme = theme
+  document.body.style.colorScheme = theme
+}
+
+watch(themeMode, (val) => {
+  try {
+    localStorage.setItem(THEME_KEY, val)
+  } catch (e) {
+    console.warn('[theme] 保存失败', e)
+  }
+})
+
+watch(
+  () => resolvedTheme.value,
+  (theme) => applyTheme(theme)
+)
+
 const showSettings = ref(false)
 
 const notice = ref('')
@@ -50,35 +95,154 @@ function onLLMHubSelect(event) {
   const detail = event.detail
   currentProvider.value = detail.provider
   currentModel.value = detail.model
+  try {
+    localStorage.setItem(
+      SELECTION_KEY,
+      JSON.stringify({ provider: detail.provider, model: detail.model })
+    )
+  } catch (e) {
+    console.warn('[selection] 保存失败', e)
+  }
 }
 
-onMounted(() => {
-  document.addEventListener('llm-hub-select', onLLMHubSelect)
+// ================= 会话管理 =================
+const conversations = ref([])
+const activeConversationId = ref('')
 
-  mql = window.matchMedia('(prefers-color-scheme: dark)')
-  systemDark.value = mql.matches
-  mql.addEventListener('change', onSchemeChange)
-})
+const activeConversation = computed(() =>
+  conversations.value.find(c => c.id === activeConversationId.value)
+)
 
-onUnmounted(() => {
-  document.removeEventListener('llm-hub-select', onLLMHubSelect)
-  mql?.removeEventListener('change', onSchemeChange)
-  clearTimeout(noticeTimer)
-})
+function makeTitleFromText(text) {
+  const t = text.trim().replace(/\s+/g, ' ')
+  return t.length > 22 ? t.slice(0, 22) + '…' : t
+}
 
-watchEffect(() => {
-  const theme = resolvedTheme.value
-  document.documentElement.setAttribute('data-theme', theme)
-  document.body.setAttribute('data-theme', theme)
-  document.documentElement.style.colorScheme = theme
-  document.body.style.colorScheme = theme
-})
+function createConversation() {
+  const id = uid('conv')
+  const conv = {
+    id,
+    title: '新对话',
+    updatedAt: Date.now(),
+    messages: [],
+  }
+  conversations.value.unshift(conv)
+  activeConversationId.value = id
+  messages.value = conv.messages
+  streaming.reset?.()
+  persist()
+  return conv
+}
 
+function switchConversation(id) {
+  if (id === activeConversationId.value) return
+  const conv = conversations.value.find(c => c.id === id)
+  if (!conv) return
+
+  streaming.reset?.()
+  activeConversationId.value = id
+  messages.value = conv.messages
+}
+
+function closeConversation(id) {
+  const idx = conversations.value.findIndex(c => c.id === id)
+  if (idx < 0) return
+  conversations.value.splice(idx, 1)
+
+  if (activeConversationId.value === id) {
+    const next = conversations.value[0]
+    if (next) {
+      streaming.reset?.()
+      activeConversationId.value = next.id
+      messages.value = next.messages
+    } else {
+      streaming.reset?.()
+      activeConversationId.value = ''
+      messages.value = []
+    }
+  }
+  persist()
+}
+
+function renameConversation(id) {
+  const conv = conversations.value.find(c => c.id === id)
+  if (!conv) return
+  const name = window.prompt('重命名对话', conv.title)
+  if (name && name.trim()) {
+    conv.title = name.trim()
+    persist()
+  }
+}
+
+watch(
+  () => messages.value.length,
+  () => {
+    const conv = activeConversation.value
+    if (!conv || conv.title !== '新对话') return
+    const firstUser = messages.value.find(m => m.role === 'user' && m.content)
+    if (firstUser) {
+      conv.title = makeTitleFromText(firstUser.content)
+      conv.updatedAt = Date.now()
+      persist()
+    }
+  }
+)
+
+let persistTimer = null
+function persist() {
+  clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    try {
+      const data = conversations.value.map(c => ({
+        id: c.id,
+        title: c.title,
+        updatedAt: c.updatedAt,
+        messages: c.messages,
+      }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
+      localStorage.setItem(STORAGE_KEY + ':active', activeConversationId.value)
+    } catch (e) {
+      console.warn('[persist] 保存失败', e)
+    }
+  }, 300)
+}
+
+function loadConversations() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return false
+    const data = JSON.parse(raw)
+    if (!Array.isArray(data) || data.length === 0) return false
+
+    conversations.value = data.map(c => ({
+      id: c.id,
+      title: c.title || '未命名对话',
+      updatedAt: c.updatedAt || Date.now(),
+      messages: Array.isArray(c.messages) ? c.messages : [],
+    }))
+
+    const savedActive = localStorage.getItem(STORAGE_KEY + ':active')
+    const target = conversations.value.find(c => c.id === savedActive) || conversations.value[0]
+    activeConversationId.value = target.id
+    messages.value = target.messages
+    return true
+  } catch (e) {
+    console.warn('[loadConversations] 读取失败', e)
+    return false
+  }
+}
+
+// ================= 发送 =================
 const presetQuestions = [
   { id: 'q1', label: '最近有点累，想聊聊', prompt: '我最近有点累，想找个人聊聊，你可以陪我说说话吗？' },
-  { id: 'q2', label: '带我做一次呼吸放松', prompt: '带我做一次三分钟的呼吸放松练习吧。' },
+  { id: 'q2', label: '带我做一次呼吸放松', prompt: '带我做一次呼吸放松练习吧。' },
   { id: 'q3', label: '我今晚睡不着', prompt: '我今晚睡不着，脑子里很乱，能陪我说说话吗？' },
+  { id: 'q4', label: '我需要解压', prompt: '很焦虑，怎么办，快告诉我' }
 ]
+
+function onPresetSelect(q) {
+  onSend({ text: q.prompt })
+}
 
 async function onSend({ text }) {
   if (!text.trim()) return
@@ -89,12 +253,20 @@ async function onSend({ text }) {
     return
   }
 
-  messages.value.push({
+  if (!activeConversationId.value) {
+    createConversation()
+  }
+
+  const conv = activeConversation.value
+  if (!conv) return
+
+  const userMsg = {
     id: uid('u'),
     role: 'user',
     content: text,
     status: 'done',
-  })
+  }
+  messages.value.push(userMsg)
 
   const assistant = streaming.createAssistant()
   messages.value.push(assistant)
@@ -118,6 +290,8 @@ async function onSend({ text }) {
     }
 
     streaming.append(assistant, { type: 'done', delta: '' })
+    conv.updatedAt = Date.now()
+    persist()
   } catch (err) {
     console.error('[chatStream] 失败:', err)
     streaming.append(assistant, {
@@ -126,6 +300,28 @@ async function onSend({ text }) {
     })
   }
 }
+
+onMounted(() => {
+  document.addEventListener('llm-hub-select', onLLMHubSelect)
+
+  mql = window.matchMedia('(prefers-color-scheme: dark)')
+  systemDark.value = mql.matches
+  mql.addEventListener('change', onSchemeChange)
+
+  applyTheme(resolvedTheme.value)
+
+  const restored = loadConversations()
+  if (!restored) {
+    createConversation()
+  }
+})
+
+onUnmounted(() => {
+  document.removeEventListener('llm-hub-select', onLLMHubSelect)
+  mql?.removeEventListener('change', onSchemeChange)
+  clearTimeout(noticeTimer)
+  clearTimeout(persistTimer)
+})
 </script>
 
 <template>
@@ -150,17 +346,42 @@ async function onSend({ text }) {
       <div v-if="notice" class="notice">{{ notice }}</div>
     </transition>
 
-    <main class="chat-area">
-      <div v-if="!currentProvider" class="hint">
-        <span>先选一个模型，再开始对话</span>
-        <button class="hint-btn" @click="showSettings = true">去设置</button>
-      </div>
+    <div class="body">
+      <aside class="conv-sidebar">
+        <div class="conv-sidebar-head">
+          <span class="conv-sidebar-title">对话</span>
+          <button class="conv-new-btn" title="新建对话" @click="createConversation">+</button>
+        </div>
 
-      <div class="chat-card">
-        <ChatContainer :messages="messages" :preset-questions="presetQuestions" :theme="resolvedTheme"
-          :assistant-name="assistantName" @send="onSend" />
-      </div>
-    </main>
+        <div class="conv-tabs">
+          <div v-for="conv in conversations" :key="conv.id" class="conv-tab"
+            :class="{ active: conv.id === activeConversationId }" @click="switchConversation(conv.id)">
+            <span class="conv-tab-title" :title="conv.title">{{ conv.title }}</span>
+            <button class="conv-tab-close" title="关闭对话" @click.stop="closeConversation(conv.id)">
+              ×
+            </button>
+          </div>
+        </div>
+
+        <div v-if="!conversations.length" class="conv-empty">
+          暂无对话
+        </div>
+      </aside>
+
+      <main class="chat-area">
+        <div v-if="!currentProvider" class="hint">
+          <span>先选一个模型，再开始对话</span>
+          <button class="hint-btn" @click="showSettings = true">去设置</button>
+        </div>
+
+        <div class="chat-card">
+          <ChatContainer :messages="messages" :preset-questions="presetQuestions" :theme="resolvedTheme"
+            welcome-logo="/favicon.ico" assistantName="助手" welcome-title="你好，有什么可以帮你？"
+            welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
+            @select="onPresetSelect" />
+        </div>
+      </main>
+    </div>
 
     <div class="mask" :class="{ show: showSettings }" @click="showSettings = false" />
 
@@ -217,7 +438,6 @@ async function onSend({ text }) {
   height: 100%;
 }
 
-/* ============ 亮色令牌 + --llm-hub-* 映射（使用 light-dark） ============ */
 :global(:root),
 :global([data-theme='light']) {
   color-scheme: light;
@@ -247,7 +467,6 @@ async function onSend({ text }) {
   --drawer-shadow: -1.5rem 0 4rem -2rem rgba(122, 92, 62, 0.35);
   --mask: rgba(72, 56, 40, 0.24);
 
-  /* --acu-* 映射 */
   --acu-bg: var(--surface-1);
   --acu-surface: var(--surface-2);
   --acu-surface-2: var(--surface-3);
@@ -284,7 +503,6 @@ async function onSend({ text }) {
   --acu-shadow: var(--shadow-md);
   --acu-shadow-lg: var(--shadow-lg);
 
-  /* --llm-hub-* 映射：light-dark() 根据 color-scheme 自动选择 */
   --llm-hub-primary: light-dark(var(--accent), #8fa8c8);
   --llm-hub-primary-hover: light-dark(var(--accent-hover), #a3bad6);
   --llm-hub-accent: light-dark(var(--accent), #8fa8c8);
@@ -302,7 +520,6 @@ async function onSend({ text }) {
   --llm-hub-radius: 0.625rem;
 }
 
-/* ============ 深色令牌 ============ */
 :global([data-theme='dark']) {
   color-scheme: dark;
 
@@ -368,7 +585,6 @@ async function onSend({ text }) {
   --acu-shadow-lg: var(--shadow-lg);
 }
 
-/* ============ 页面 ============ */
 .page {
   --glow-a: rgba(255, 206, 166, 0.78);
   --glow-b: rgba(255, 198, 186, 0.66);
@@ -401,7 +617,6 @@ async function onSend({ text }) {
   --glow-c: rgba(36, 46, 60, 0.4);
 }
 
-/* ============ 顶栏 ============ */
 .topbar {
   flex: 0 0 auto;
   display: flex;
@@ -474,7 +689,10 @@ async function onSend({ text }) {
   border-color: var(--acu-primary-soft);
 }
 
-/* ============ 提示 ============ */
+:deep(.acu-welcome-logo) {
+  display: none;
+}
+
 .notice {
   position: fixed;
   top: clamp(3.25rem, 8vh, 4.25rem);
@@ -489,6 +707,149 @@ async function onSend({ text }) {
   border-radius: 999rem;
   box-shadow: var(--acu-shadow);
   max-width: 90%;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+
+.conv-sidebar {
+  flex: 0 0 auto;
+  width: 13.5rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 0.0625rem solid var(--acu-border);
+  background: var(--acu-bg);
+}
+
+.conv-sidebar-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: clamp(0.5rem, 1.2vh, 0.75rem) clamp(0.5rem, 1vw, 0.75rem);
+  border-bottom: 0.0625rem solid var(--acu-border);
+}
+
+.conv-sidebar-title {
+  font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--acu-text-muted);
+}
+
+.conv-new-btn {
+  width: 1.75rem;
+  height: 1.75rem;
+  display: grid;
+  place-items: center;
+  font-size: 1.125rem;
+  line-height: 1;
+  color: var(--acu-text-secondary);
+  background: transparent;
+  border: 0.0625rem solid var(--acu-border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.conv-new-btn:hover {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+}
+
+.conv-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  padding: 0.375rem;
+}
+
+.conv-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.4375rem 0.5rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: background 0.18s ease;
+  min-width: 0;
+}
+
+.conv-tab:hover {
+  background: var(--acu-surface-2);
+}
+
+.conv-tab.active {
+  background: var(--acu-primary-soft);
+}
+
+.conv-tab-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
+  color: var(--acu-text-secondary);
+}
+
+.conv-tab.active .conv-tab-title {
+  color: var(--acu-primary);
+  font-weight: 500;
+}
+
+.conv-tab-close {
+  flex: 0 0 auto;
+  width: 1.125rem;
+  height: 1.125rem;
+  display: grid;
+  place-items: center;
+  font-size: 0.875rem;
+  line-height: 1;
+  color: var(--acu-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.conv-tab:hover .conv-tab-close {
+  opacity: 1;
+}
+
+.conv-tab-close:hover {
+  color: var(--acu-error);
+  background: var(--acu-error-soft);
+}
+
+.conv-empty {
+  padding: 1rem;
+  font-size: 0.75rem;
+  color: var(--acu-text-muted);
+  text-align: center;
+}
+
+.chat-area {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0.25rem clamp(0.625rem, 1.6vw, 1.375rem) clamp(0.75rem, 1.8vh, 1.375rem);
+  gap: clamp(0.5rem, 1vh, 0.75rem);
 }
 
 .hint {
@@ -515,18 +876,6 @@ async function onSend({ text }) {
   cursor: pointer;
 }
 
-/* ============ 聊天区 ============ */
-.chat-area {
-  flex: 1 1 auto;
-  min-height: 0;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  padding: 0.25rem clamp(0.625rem, 1.6vw, 1.375rem) clamp(0.75rem, 1.8vh, 1.375rem);
-  gap: clamp(0.5rem, 1vh, 0.75rem);
-}
-
 .chat-card {
   width: 100%;
   flex: 1 1 auto;
@@ -546,7 +895,6 @@ async function onSend({ text }) {
   min-width: 0;
 }
 
-/* ============ 遮罩 ============ */
 .mask {
   position: fixed;
   inset: 0;
@@ -562,7 +910,6 @@ async function onSend({ text }) {
   pointer-events: auto;
 }
 
-/* ============ 设置抽屉 ============ */
 .drawer {
   position: fixed;
   top: 0;
@@ -808,7 +1155,6 @@ async function onSend({ text }) {
   background: var(--acu-primary-hover);
 }
 
-/* ============ 过渡与响应式 ============ */
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.35s ease, transform 0.35s ease;
@@ -824,11 +1170,37 @@ async function onSend({ text }) {
   .drawer {
     width: 60vw;
   }
+
+  .conv-sidebar {
+    width: 11.5rem;
+  }
 }
 
 @media (max-width: 48rem) {
   .topbar {
     padding: clamp(0.5rem, 1.6vh, 0.75rem) clamp(0.625rem, 3vw, 1rem) 0.375rem;
+  }
+
+  .body {
+    flex-direction: column;
+  }
+
+  .conv-sidebar {
+    width: 100%;
+    max-height: 7.5rem;
+    border-right: none;
+    border-bottom: 0.0625rem solid var(--acu-border);
+  }
+
+  .conv-tabs {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .conv-tab {
+    flex: 0 0 auto;
+    max-width: 10rem;
   }
 
   .chat-area {
