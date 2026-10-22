@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { ChatContainer } from 'zen-ai-chat-ui'
 import 'zen-ai-chat-ui/style.css'
 import '@inteye/llm-hub-ui/element'
@@ -10,6 +10,8 @@ import './styles/theme.css'
 import AppHeader from './components/AppHeader.vue'
 import ConversationSidebar from './components/ConversationSidebar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
+import ConversationTree from './components/ConversationTree.vue'
+import EditMessageDialog from './components/EditMessageDialog.vue'
 
 import { useTheme } from './composables/useTheme'
 import { useNotice } from './composables/useNotice'
@@ -22,6 +24,7 @@ const { themeLabel, resolvedTheme, cycleTheme, init: initTheme, destroy: destroy
 const { notice, showNotice, cleanup: cleanupNotice } = useNotice()
 
 const showSettings = ref(false)
+const showTree = ref(false)
 const currentProvider = ref('')
 const currentModel = ref('')
 const settingsRef = ref(null)
@@ -38,17 +41,12 @@ const settingsRef = ref(null)
   })()
 
 function onLLMHubSelect(event) {
-  const detail = event.detail
-  currentProvider.value = detail.provider
-  currentModel.value = detail.model
+  const d = event.detail
+  currentProvider.value = d.provider
+  currentModel.value = d.model
   try {
-    localStorage.setItem(
-      SELECTION_KEY,
-      JSON.stringify({ provider: detail.provider, model: detail.model })
-    )
-  } catch (e) {
-    console.warn('[selection] 保存失败', e)
-  }
+    localStorage.setItem(SELECTION_KEY, JSON.stringify({ provider: d.provider, model: d.model }))
+  } catch { }
 }
 
 let chatStream
@@ -56,12 +54,13 @@ const conv = useConversations({
   showNotice,
   onConversationSwitch: () => chatStream?.streaming?.reset?.(),
 })
-chatStream = useChatStream(conv.messages)
+chatStream = useChatStream({ addNode: conv.addNode, persist: conv.persist })
 
 const {
-  conversations, activeConversationId, activeConversation, messages,
-  selectMode, selectedIds,
+  conversations, activeConversationId, activeConversation,
+  messages, selectMode, selectedIds,
   createConversation, switchConversation, closeConversation,
+  editUserMessage, revertToNode, switchToNode,
   enterSelectMode, cancelSelectMode, toggleSelect, toggleSelectAll,
   exportAllConversations, exportSelected, handleImport,
   persist, loadConversations,
@@ -80,28 +79,226 @@ function onPresetSelect(q) {
 
 async function onSend({ text }) {
   if (!text.trim()) return
-
   if (!currentProvider.value) {
     showNotice('请先在右上角设置中选择模型')
     showSettings.value = true
     return
   }
-
   if (!activeConversationId.value) createConversation()
-
   const current = activeConversation.value
   if (!current) return
-
   await chatStream.send({
     text,
     provider: currentProvider.value,
     model: currentModel.value,
     client: settingsRef.value?.getClient(),
-    onAfter: () => {
-      current.updatedAt = Date.now()
-      persist()
-    },
+    conversation: current,
   })
+}
+
+// ============ 树操作 ============
+function onSwitchNode(nodeId) {
+  switchToNode(nodeId)
+  persist()
+}
+
+function onRevert(nodeId) {
+  revertToNode(nodeId)
+  persist()
+}
+
+async function onEditMessage({ nodeId, content }) {
+  const current = activeConversation.value
+  if (!current) return
+  if (!currentProvider.value) {
+    showNotice('请先在右上角设置中选择模型')
+    showSettings.value = true
+    return
+  }
+  const newNode = editUserMessage(nodeId, content)
+  if (!newNode) return
+  persist()
+  await chatStream.generateAssistant({
+    userNodeId: newNode.id,
+    provider: currentProvider.value,
+    model: currentModel.value,
+    client: settingsRef.value?.getClient(),
+    conversation: current,
+  })
+}
+
+async function onRegenerate(nodeId) {
+  const current = activeConversation.value
+  if (!current) return
+  if (!currentProvider.value) {
+    showNotice('请先在右上角设置中选择模型')
+    showSettings.value = true
+    return
+  }
+  await chatStream.regenerate({
+    assistantNodeId: nodeId,
+    provider: currentProvider.value,
+    model: currentModel.value,
+    client: settingsRef.value?.getClient(),
+    conversation: current,
+  })
+}
+
+// ============ 编辑弹窗 ============
+const editDialogVisible = ref(false)
+const editDialogMessage = ref(null)
+const editDialogContent = ref('')
+
+function openEditDialog(msg) {
+  if (!currentProvider.value) {
+    showNotice('请先在右上角设置中选择模型')
+    showSettings.value = true
+    return
+  }
+  editDialogMessage.value = msg
+  editDialogContent.value = msg.content || ''
+  editDialogVisible.value = true
+}
+
+function closeEditDialog() {
+  editDialogVisible.value = false
+  editDialogMessage.value = null
+  editDialogContent.value = ''
+}
+
+async function submitEditDialog(text) {
+  const msg = editDialogMessage.value
+  if (!msg) return
+  const next = (text || '').trim()
+  if (!next || next === (msg.content || '').trim()) {
+    closeEditDialog()
+    return
+  }
+  const nodeId = msg.id
+  closeEditDialog()
+  await onEditMessage({ nodeId, content: next })
+}
+
+// ============ 气泡下方操作条 ============
+const chatWrapper = ref(null)
+const domMessageIdMap = new WeakMap()
+
+function buildActionBarHtml(role) {
+  const editBtn = `
+    <button class="msg-action-btn" data-action="edit" title="修改">
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+    </button>`
+  const revertBtn = `
+    <button class="msg-action-btn" data-action="revert" title="撤回此消息及之后">
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M3 8h9M6 4.5L2.5 8 6 11.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>`
+  const regenBtn = `
+    <button class="msg-action-btn" data-action="regenerate" title="重新生成">
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M13 4v4h-4M3 12V8h4M12.5 8a4.5 4.5 0 00-8-2.5M3.5 8a4.5 4.5 0 008 2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>`
+  if (role === 'user') return editBtn + revertBtn
+  if (role === 'assistant') return regenBtn
+  return ''
+}
+
+async function attachActionBars(retry = 0) {
+  await nextTick()
+  if (!chatWrapper.value) return
+
+  const hosts = Array.from(chatWrapper.value.querySelectorAll('.acu-bubble-main'))
+
+  // 消息有内容但 DOM 还没渲染出来，延迟重试（最多 20 次 × 50ms = 1s）
+  if (hosts.length === 0 && messages.value.length > 0) {
+    if (retry < 20) {
+      setTimeout(() => attachActionBars(retry + 1), 50)
+    }
+    return
+  }
+
+  // 数量对不上时静默放弃，避免错位注入
+  if (hosts.length !== messages.value.length) return
+
+  // 清理旧注入后再挂新的
+  chatWrapper.value.querySelectorAll('.msg-action-bar').forEach(el => el.remove())
+
+  hosts.forEach((el, index) => {
+    const msg = messages.value[index]
+    if (!msg?.id) return
+
+    domMessageIdMap.set(el, msg.id)
+
+    if (getComputedStyle(el).position === 'static') {
+      el.style.position = 'relative'
+    }
+
+    const bar = document.createElement('div')
+    bar.className = 'msg-action-bar'
+    bar.dataset.messageId = msg.id
+    bar.dataset.role = msg.role
+    bar.innerHTML = buildActionBarHtml(msg.role)
+    el.appendChild(bar)
+  })
+}
+
+watch(
+  () => messages.value.map(m => m.id).join('|'),
+  () => attachActionBars(),
+  { immediate: true }
+)
+
+// ============ 点击委托 ============
+function onWrapperClickCapture(e) {
+  const actionBtn = e.target.closest('.msg-action-btn')
+  if (actionBtn) {
+    e.stopPropagation()
+    e.preventDefault()
+    const action = actionBtn.dataset.action
+    const bar = actionBtn.closest('.msg-action-bar')
+    const messageId = bar?.dataset.messageId
+    if (!messageId) return
+
+    if (action === 'revert') {
+      onRevert(messageId)
+    } else if (action === 'edit') {
+      const msg = messages.value.find(m => m.id === messageId)
+      if (msg) openEditDialog(msg)
+    } else if (action === 'regenerate') {
+      onRegenerate(messageId)
+    }
+    return
+  }
+
+  // zen 内建"重新生成"按钮的捕获拦截（没有公开事件）
+  const btn = e.target.closest('button, [role="button"]')
+  if (!btn) return
+  const hint = (
+    btn.getAttribute('title') ||
+    btn.getAttribute('aria-label') ||
+    btn.innerText ||
+    ''
+  ).toLowerCase()
+  const isRegenerate =
+    hint.includes('重新生成') || hint.includes('regenerate') ||
+    hint.includes('重试') || hint.includes('retry')
+  if (!isRegenerate) return
+
+  let node = btn
+  while (node && node !== chatWrapper.value) {
+    if (domMessageIdMap.has(node)) {
+      const messageId = domMessageIdMap.get(node)
+      e.stopPropagation()
+      e.preventDefault()
+      onRegenerate(messageId)
+      return
+    }
+    node = node.parentElement
+  }
 }
 
 onMounted(() => {
@@ -109,10 +306,15 @@ onMounted(() => {
   initTheme()
   const restored = loadConversations()
   if (!restored) createConversation()
+
+  nextTick(() => {
+    chatWrapper.value?.addEventListener('click', onWrapperClickCapture, true)
+  })
 })
 
 onUnmounted(() => {
   document.removeEventListener('llm-hub-select', onLLMHubSelect)
+  chatWrapper.value?.removeEventListener('click', onWrapperClickCapture, true)
   destroyTheme()
   cleanupNotice()
 })
@@ -140,7 +342,7 @@ onUnmounted(() => {
           <button class="hint-btn" @click="showSettings = true">去设置</button>
         </div>
 
-        <div class="chat-card">
+        <div ref="chatWrapper" class="chat-card">
           <ChatContainer :messages="messages" :preset-questions="presetQuestions" :theme="resolvedTheme"
             welcome-logo="/favicon.ico" assistantName="助手" welcome-title="你好，有什么可以帮你？"
             welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
@@ -148,6 +350,24 @@ onUnmounted(() => {
         </div>
       </main>
     </div>
+
+    <button class="tree-fab" :class="{ active: showTree }" :title="showTree ? '隐藏对话树' : '显示对话树'"
+      @click="showTree = !showTree">
+      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <circle cx="4" cy="4" r="1.5" stroke="currentColor" stroke-width="1.4" />
+        <circle cx="4" cy="16" r="1.5" stroke="currentColor" stroke-width="1.4" />
+        <circle cx="16" cy="10" r="1.5" stroke="currentColor" stroke-width="1.4" />
+        <path d="M5.5 4.5v3c0 1.1.9 2 2 2h7M5.5 15.5v-3c0-1.1.9-2 2-2h7" stroke="currentColor" stroke-width="1.4"
+          stroke-linecap="round" />
+      </svg>
+    </button>
+
+    <ConversationTree v-if="activeConversation" :conversation="activeConversation"
+      :current-leaf-id="activeConversation.currentLeafId" :visible="showTree" @update:visible="showTree = $event"
+      @switch-node="onSwitchNode" @revert="onRevert" @edit="onEditMessage" @regenerate="onRegenerate" />
+
+    <EditMessageDialog :visible="editDialogVisible" :content="editDialogContent" @close="closeEditDialog"
+      @submit="submitEditDialog" />
 
     <SettingsDrawer ref="settingsRef" :show-settings="showSettings" :current-provider="currentProvider"
       :current-model="currentModel" @close="showSettings = false" />
@@ -166,18 +386,15 @@ onUnmounted(() => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-
   color: var(--acu-text);
   font-size: clamp(0.8125rem, 0.75rem + 0.25vw, 0.9375rem);
   line-height: 1.5;
   letter-spacing: 0.012em;
-
   background:
     radial-gradient(70vw 34vh at 8% -8%, var(--glow-a) 0%, transparent 62%),
     radial-gradient(62vw 30vh at 104% 4%, var(--glow-b) 0%, transparent 58%),
     radial-gradient(68vw 40vh at 50% 118%, var(--glow-c) 0%, transparent 60%),
     var(--acu-bg);
-
   transition: background-color 0.6s ease, color 0.4s ease;
 }
 
@@ -268,6 +485,95 @@ onUnmounted(() => {
   display: none;
 }
 
+/* ===== 气泡下方常驻操作条 ===== */
+/* 给 .acu-bubble-main 预留底部空间，操作条绝对定位在气泡下方 */
+:deep(.acu-bubble-main) {
+  margin-bottom: 1.75rem;
+}
+
+:deep(.msg-action-bar) {
+  position: absolute;
+  top: 100%;
+  right: 0.25rem;
+  margin-top: 0.25rem;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.375rem;
+  background: var(--acu-bg);
+  border: 1px solid var(--acu-border);
+  box-shadow: var(--acu-shadow-sm);
+  opacity: 0.75;
+  pointer-events: auto;
+  transition: opacity 0.15s ease;
+  user-select: none;
+}
+
+:deep(.acu-bubble-main:hover .msg-action-bar) {
+  opacity: 1;
+}
+
+:deep(.msg-action-btn) {
+  width: 1.25rem;
+  height: 1.25rem;
+  display: grid;
+  place-items: center;
+  color: var(--acu-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+:deep(.msg-action-btn svg) {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+:deep(.msg-action-btn:hover) {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+}
+
+:deep(.msg-action-btn:focus-visible) {
+  outline: 0.125rem solid var(--acu-primary);
+  outline-offset: 0.0625rem;
+}
+
+/* 树状图悬浮按钮 */
+.tree-fab {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 46;
+  width: 2.75rem;
+  height: 2.75rem;
+  display: grid;
+  place-items: center;
+  color: var(--acu-text-secondary);
+  background: var(--acu-bg);
+  border: 0.0625rem solid var(--acu-border);
+  border-radius: 50%;
+  box-shadow: var(--acu-shadow-lg);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.tree-fab svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.tree-fab:hover,
+.tree-fab.active {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+}
+
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.35s ease, transform 0.35s ease;
@@ -297,6 +603,10 @@ onUnmounted(() => {
 
   .chat-card,
   .page {
+    transition: none;
+  }
+
+  :deep(.msg-action-bar) {
     transition: none;
   }
 }
