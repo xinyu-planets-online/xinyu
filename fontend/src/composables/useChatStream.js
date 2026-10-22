@@ -1,9 +1,9 @@
 import { useStreaming } from 'zen-ai-chat-ui'
+import { putMessage, putConversation, putAttachment } from '@/db/chatRepository'
 
-export function useChatStream({ addNode, persist }) {
+export function useChatStream({ addNode }) {
     const streaming = useStreaming()
 
-    // 从 user 节点回溯得到历史（包含该 user 节点自身）
     function buildHistory(conv, userNodeId) {
         const history = []
         let cur = userNodeId
@@ -11,14 +11,25 @@ export function useChatStream({ addNode, persist }) {
         while (cur && conv.nodes[cur] && !guard.has(cur)) {
             guard.add(cur)
             const n = conv.nodes[cur]
-            history.unshift({ role: n.role, content: n.content })
+            let content = n.content || ''
+            const atts = n.attachments || []
+            if (atts.length) {
+                const lines = atts.map(a => `[附件: ${a.name}] ${a.summary}`).join('\n')
+                content = content ? `${content}\n\n${lines}` : lines
+            }
+            if (content) history.unshift({ role: n.role, content })
             cur = n.parentId
         }
-        return history.filter(m => m.role !== 'assistant' || m.content)
+        return history
     }
 
-    // 从指定 user 节点开始生成 assistant
-    async function generateAssistant({ userNodeId, provider, model, client, conversation }) {
+    async function generateAssistant({
+        userNodeId,
+        provider,
+        model,
+        client,
+        conversation,
+    }) {
         if (!client) throw new Error('llm-hub-config 尚未就绪')
         if (!conversation?.nodes[userNodeId]) return
 
@@ -27,6 +38,7 @@ export function useChatStream({ addNode, persist }) {
         const assistant = streaming.createAssistant()
         assistant.parentId = userNodeId
         assistant.createdAt = Date.now()
+        assistant.attachments = []
         conversation.nodes[assistant.id] = assistant
         conversation.currentLeafId = assistant.id
         conversation.updatedAt = Date.now()
@@ -39,30 +51,47 @@ export function useChatStream({ addNode, persist }) {
             streaming.append(assistant, { type: 'done', delta: '' })
         } catch (err) {
             console.error('[chatStream] 失败:', err)
-            streaming.append(assistant, { type: 'error', delta: err?.message || '请求失败' })
+            streaming.append(assistant, {
+                type: 'error',
+                delta: err?.message || '请求失败',
+            })
         } finally {
-            persist?.()
+            await putMessage({ ...assistant, conversationId: conversation.id })
+            await putConversation(conversation)
         }
     }
 
-    // 用户发新消息
-    async function send({ text, provider, model, client, conversation }) {
-        if (!text?.trim()) return
-        const userNode = addNode({ role: 'user', content: text })
+    async function send({ text, files = [], provider, model, client, conversation }) {
+        if (!text?.trim() && !files.length) return
+        const userNode = await addNode({ role: 'user', content: text || '' })
         if (!userNode) return
+
+        if (files.length) {
+            userNode.attachments = files
+            for (const f of files) {
+                await putAttachment({ ...f, messageId: userNode.id })
+            }
+            await putConversation(conversation)
+        }
+
         await generateAssistant({
             userNodeId: userNode.id,
-            provider, model, client, conversation,
+            provider,
+            model,
+            client,
+            conversation,
         })
     }
 
-    // 重新生成某条 assistant 回答（基于其 parentId 对应的 user 节点）
     async function regenerate({ assistantNodeId, provider, model, client, conversation }) {
         const node = conversation?.nodes[assistantNodeId]
         if (!node || node.role !== 'assistant') return
         await generateAssistant({
             userNodeId: node.parentId,
-            provider, model, client, conversation,
+            provider,
+            model,
+            client,
+            conversation,
         })
     }
 

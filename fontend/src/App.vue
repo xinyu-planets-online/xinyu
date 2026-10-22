@@ -17,6 +17,7 @@ import { useTheme } from './composables/useTheme'
 import { useNotice } from './composables/useNotice'
 import { useConversations } from './composables/useConversations'
 import { useChatStream } from './composables/useChatStream'
+import { summarizeFile, unwrapFile } from './composables/useAttachmentSummary'
 
 const SELECTION_KEY = 'chat-selection'
 
@@ -54,7 +55,7 @@ const conv = useConversations({
   showNotice,
   onConversationSwitch: () => chatStream?.streaming?.reset?.(),
 })
-chatStream = useChatStream({ addNode: conv.addNode, persist: conv.persist })
+chatStream = useChatStream({ addNode: conv.addNode })
 
 const {
   conversations, activeConversationId, activeConversation,
@@ -63,7 +64,7 @@ const {
   editUserMessage, revertToNode, switchToNode,
   enterSelectMode, cancelSelectMode, toggleSelect, toggleSelectAll,
   exportAllConversations, exportSelected, handleImport,
-  persist, loadConversations,
+  loadConversations,
 } = conv
 
 const presetQuestions = [
@@ -74,21 +75,39 @@ const presetQuestions = [
 ]
 
 function onPresetSelect(q) {
-  onSend({ text: q.prompt })
+  onSend({ text: q.prompt, files: [] })
 }
 
-async function onSend({ text }) {
-  if (!text.trim()) return
+async function onSend({ text, files }) {
+  const hasText = !!text?.trim()
+  const hasFiles = Array.isArray(files) && files.length > 0
+  if (!hasText && !hasFiles) return
+
   if (!currentProvider.value) {
     showNotice('请先在右上角设置中选择模型')
     showSettings.value = true
     return
   }
-  if (!activeConversationId.value) createConversation()
+  if (!activeConversationId.value) await createConversation()
   const current = activeConversation.value
   if (!current) return
+
+  const summaries = []
+  if (hasFiles) {
+    for (const f of files) {
+      const raw = unwrapFile(f)
+      if (!raw) continue
+      try {
+        summaries.push(await summarizeFile(raw))
+      } catch (e) {
+        console.warn('[summary] 失败', e)
+      }
+    }
+  }
+
   await chatStream.send({
-    text,
+    text: text || '',
+    files: summaries,
     provider: currentProvider.value,
     model: currentModel.value,
     client: settingsRef.value?.getClient(),
@@ -97,14 +116,12 @@ async function onSend({ text }) {
 }
 
 // ============ 树操作 ============
-function onSwitchNode(nodeId) {
-  switchToNode(nodeId)
-  persist()
+async function onSwitchNode(nodeId) {
+  await switchToNode(nodeId)
 }
 
-function onRevert(nodeId) {
-  revertToNode(nodeId)
-  persist()
+async function onRevert(nodeId) {
+  await revertToNode(nodeId)
 }
 
 async function onEditMessage({ nodeId, content }) {
@@ -115,9 +132,8 @@ async function onEditMessage({ nodeId, content }) {
     showSettings.value = true
     return
   }
-  const newNode = editUserMessage(nodeId, content)
+  const newNode = await editUserMessage(nodeId, content)
   if (!newNode) return
-  persist()
   await chatStream.generateAssistant({
     userNodeId: newNode.id,
     provider: currentProvider.value,
@@ -213,30 +229,21 @@ async function attachActionBars(retry = 0) {
 
   const hosts = Array.from(chatWrapper.value.querySelectorAll('.acu-bubble-main'))
 
-  // 消息有内容但 DOM 还没渲染出来，延迟重试（最多 20 次 × 50ms = 1s）
   if (hosts.length === 0 && messages.value.length > 0) {
-    if (retry < 20) {
-      setTimeout(() => attachActionBars(retry + 1), 50)
-    }
+    if (retry < 20) setTimeout(() => attachActionBars(retry + 1), 50)
     return
   }
-
-  // 数量对不上时静默放弃，避免错位注入
   if (hosts.length !== messages.value.length) return
 
-  // 清理旧注入后再挂新的
   chatWrapper.value.querySelectorAll('.msg-action-bar').forEach(el => el.remove())
 
   hosts.forEach((el, index) => {
     const msg = messages.value[index]
     if (!msg?.id) return
-
     domMessageIdMap.set(el, msg.id)
-
     if (getComputedStyle(el).position === 'static') {
       el.style.position = 'relative'
     }
-
     const bar = document.createElement('div')
     bar.className = 'msg-action-bar'
     bar.dataset.messageId = msg.id
@@ -274,7 +281,6 @@ function onWrapperClickCapture(e) {
     return
   }
 
-  // zen 内建"重新生成"按钮的捕获拦截（没有公开事件）
   const btn = e.target.closest('button, [role="button"]')
   if (!btn) return
   const hint = (
@@ -301,12 +307,11 @@ function onWrapperClickCapture(e) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   document.addEventListener('llm-hub-select', onLLMHubSelect)
   initTheme()
-  const restored = loadConversations()
-  if (!restored) createConversation()
-
+  const restored = await loadConversations()
+  if (!restored) await createConversation()
   nextTick(() => {
     chatWrapper.value?.addEventListener('click', onWrapperClickCapture, true)
   })
@@ -485,8 +490,6 @@ onUnmounted(() => {
   display: none;
 }
 
-/* ===== 气泡下方常驻操作条 ===== */
-/* 给 .acu-bubble-main 预留底部空间，操作条绝对定位在气泡下方 */
 :deep(.acu-bubble-main) {
   margin-bottom: 1.75rem;
 }
@@ -543,7 +546,6 @@ onUnmounted(() => {
   outline-offset: 0.0625rem;
 }
 
-/* 树状图悬浮按钮 */
 .tree-fab {
   position: fixed;
   right: 1rem;
