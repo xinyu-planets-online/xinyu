@@ -1,0 +1,316 @@
+{
+  "meta": {
+    "title": "心理舒缓聊天平台 API 规范（Keycloak OIDC + 后端过滤器认证 + 密文 JSON 管理）",
+    "version": "0.0.11",
+    "last_updated": "2026-10-22",
+    "description": "本规范仅定义 HTTP/JSON 接口契约，不假设后端实现语言、框架、数据库或加密算法，也不规定前端实现方式。聊天数据由前端以 JSON 管理，导入导出仅在前端发生，后端不提供导入导出接口。认证由 Keycloak OIDC 与后端过滤器承担，access_token / id_token / refresh_token 由后端持有，不经由本规范定义的接口向调用方暴露。未认证行为由端点自身语义决定：/auth/login 与 /auth/logout 语义上为重定向入口，返回 302；/auth/callback 为 Keycloak 回调入口，放行后完成授权码到令牌的后端到后端交换并返回 302；/chat-data 与 /chat-data/info 语义上为受保护数据 API，未认证时由后端过滤器返回 401 JSON，不返回重定向或登录页。后端仅在 GET /chat-data/info、GET /chat-data、PUT /chat-data、DELETE /chat-data 中参与密文 JSON 的拉取、全量覆盖与物理删除。上传即覆盖，不保留旧版本；多端同时上传不做额外协调，最后写入生效；覆盖确认展示服务端记录的上次上传时间与用户填写的存档备注，不计算或比较大小差异。custom_summary 为存档备注，不是聊天内容；超出长度上限时截断保存，存档照常落盘；上传请求总大小由部署层自行处理，不在本契约中定义。后端不读取、不解析、不裁剪、不记录、不返回聊天明文，仅原样保存和返回前端提交的不透明密文 JSON 及存档备注。加解密仅由前端承担；用户独立加密密码不传输、不存储、不可取回。",
+    "todos": []
+  },
+  "apis": [
+    {
+      "path": "/auth/login",
+      "method": "GET",
+      "description": "返回 302 重定向到 Keycloak Authorization Endpoint，用于发起 OIDC 授权码流程。",
+      "detail": "后端构造 Keycloak 授权 URL 并以 302 返回。授权 URL 至少包含 response_type=code、client_id、redirect_uri（指向 /auth/callback）、scope=openid；state 由后端生成并与本地状态关联，用于回调校验；若 Keycloak client 启用 PKCE，需附加 code_challenge 与 code_challenge_method=S256。本端点不读取、不返回任何聊天数据。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "302",
+          "body": {},
+          "description": "重定向到 Keycloak Authorization Endpoint。Location 头包含完整授权 URL。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "无法构造授权重定向"
+          },
+          "description": "后端过滤器内部错误。"
+        }
+      ]
+    },
+    {
+      "path": "/auth/callback",
+      "method": "GET",
+      "description": "Keycloak OIDC 授权码回调端点。后端在此完成 authorization_code 到令牌的交换，并建立本地会话。",
+      "detail": "本端点为 Keycloak 回调入口，过滤器必须放行（不校验会话）。Keycloak 在用户登录成功后会将浏览器重定向到此端点，携带 code 与 state。后端应：1）校验 state 与发起登录时保存的值一致；2）用 code 向 Keycloak Token Endpoint（/protocol/openid-connect/token）发起后端到后端 POST，grant_type=authorization_code，redirect_uri 必须与授权请求中的 redirect_uri 完全一致，client_id 与 client_secret（或 PKCE code_verifier）由后端持有，不经由浏览器；3）交换成功后建立本地会话（如 HttpOnly Cookie），返回 302 到前端应用页面；4）交换失败则返回 401。Keycloak 26+ 可能附加 iss 参数，后端应校验其与配置的 issuer 一致（若存在）。redirect_uri 必须是应用自己的干净路径，不得在 redirect_uri 中附带 state、code 等 OIDC 参数，Keycloak 26+ 默认拒绝此类 URI。本端点不读取、不返回任何聊天数据。",
+      "request": {
+        "query": {
+          "code": {
+            "type": "string",
+            "required": true,
+            "description": "Keycloak 发放的 authorization code，由 Keycloak 在回调时附加到查询字符串。"
+          },
+          "state": {
+            "type": "string",
+            "required": true,
+            "description": "发起登录时后端生成的 state，用于回调时校验，防止 CSRF 与重放。"
+          },
+          "iss": {
+            "type": "string",
+            "required": false,
+            "description": "Keycloak 26+ 可能附加的 Issuer 参数，用于防止 Mix-Up 攻击；后端应校验其与配置的 issuer 一致（若存在）。"
+          }
+        },
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "302",
+          "body": {},
+          "description": "令牌交换成功并建立本地会话后，重定向到前端应用页面（由后端配置指定）。"
+        },
+        {
+          "status": "401",
+          "body": {
+            "error_code": "auth_callback_failed",
+            "message": "授权码交换失败或 state 校验不通过"
+          },
+          "description": "回调处理失败，不建立会话。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "令牌交换内部错误"
+          },
+          "description": "后端与 Keycloak Token Endpoint 通信失败或内部处理异常。"
+        }
+      ]
+    },
+    {
+      "path": "/auth/logout",
+      "method": "GET",
+      "description": "注销本地会话并返回 302 重定向到 Keycloak End Session Endpoint，用于发起 RP-Initiated Logout。",
+      "detail": "后端使本地会话失效后，构造 Keycloak End Session Endpoint URL 并以 302 返回。URL 至少包含 post_logout_redirect_uri；建议同时包含 id_token_hint 或 client_id。Keycloak 18+ 已废弃登出时的 redirect_uri 参数，必须使用 post_logout_redirect_uri 配合 id_token_hint。post_logout_redirect_uri 必须是应用自己的干净路径，不得指向 Keycloak 登录页。本端点不处理、不删除用户已上传的密文 JSON。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "302",
+          "body": {},
+          "description": "重定向到 Keycloak End Session Endpoint，完成登出后由 Keycloak 重定向回 post_logout_redirect_uri。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "无法构造登出重定向"
+          },
+          "description": "后端过滤器内部错误。"
+        }
+      ]
+    },
+    {
+      "path": "/chat-data/info",
+      "method": "GET",
+      "description": "返回当前会话主体上次上传的覆盖确认信息（服务端记录的上次上传时间、存档备注、载荷版本）。",
+      "detail": "本端点为受保护数据 API，未认证时由后端过滤器返回 401 JSON，不返回重定向或登录页。认证通过后仅返回上次上传的元数据，不返回 cipher_payload，不解析密文，不返回数据大小，不计算或比较任何大小差异。覆盖流程约定：PUT /chat-data 全量覆盖前，通过本接口获取上次上传信息以支持覆盖确认；确认后可携带新的 custom_summary 执行覆盖。若当前无数据，返回 exists=false；若上传时未提供 custom_summary，则该字段返回 null。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "200",
+          "body": {
+            "exists": true,
+            "payload_version": "frontend-defined-payload-version",
+            "updated_at": "ISO-8601-time-string",
+            "custom_summary": "user-provided-summary-or-null"
+          },
+          "description": "返回上次上传的覆盖确认信息。若 exists=false，则 payload_version、updated_at、custom_summary 为 null；若上传时未提供 custom_summary，则该字段为 null；若上传时 custom_summary 超长被截断，则返回截断后的值。"
+        },
+        {
+          "status": "401",
+          "body": {
+            "error_code": "unauthenticated",
+            "message": "未认证"
+          },
+          "description": "受保护数据 API 未认证，由后端过滤器统一返回。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "服务端内部错误"
+          },
+          "description": "未预期服务端错误。"
+        }
+      ]
+    },
+    {
+      "path": "/chat-data",
+      "method": "GET",
+      "description": "返回当前会话主体对应的完整密文 JSON 数据集。",
+      "detail": "本端点为受保护数据 API，未认证时由后端过滤器返回 401 JSON，不返回重定向或登录页。认证通过后，仅返回前端此前上传并由后端原样保存的不透明密文 JSON 及元数据；后端不解析、不裁剪、不合并、不迁移、不记录内容，不返回数据大小。导入导出仅在前端发生，本接口不提供导出文件生成。若当前无数据，返回 exists=false；若上传时未提供 custom_summary，则该字段返回 null。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "200",
+          "body": {
+            "exists": true,
+            "payload_version": "frontend-defined-payload-version",
+            "cipher_payload": {
+              "opaque": "前端管理的完整密文 JSON；后端仅原样保存和返回，不解析其内容"
+            },
+            "updated_at": "ISO-8601-time-string",
+            "custom_summary": "user-provided-summary-or-null"
+          },
+          "description": "返回当前会话主体对应的完整密文 JSON。若 exists=false，则 payload_version、cipher_payload、updated_at、custom_summary 为 null；若上传时未提供 custom_summary，则该字段为 null；若上传时 custom_summary 超长被截断，则返回截断后的值。"
+        },
+        {
+          "status": "401",
+          "body": {
+            "error_code": "unauthenticated",
+            "message": "未认证"
+          },
+          "description": "受保护数据 API 未认证，由后端过滤器统一返回。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "服务端内部错误"
+          },
+          "description": "未预期服务端错误。"
+        }
+      ]
+    },
+    {
+      "path": "/chat-data",
+      "method": "PUT",
+      "description": "上传并全量覆盖当前会话主体对应的密文 JSON 数据集。",
+      "detail": "本端点为受保护数据 API，未认证时由后端过滤器返回 401 JSON，不返回重定向或登录页。认证通过后，以请求中的完整密文 JSON 替换当前已保存数据；不保留旧版本、不生成历史副本、不存储导出文件、不合并、不解析、不裁剪。多端同时上传不做额外协调，最后写入生效。覆盖流程约定：覆盖前通过 GET /chat-data/info 获取上次上传信息用于覆盖确认，确认后可携带新的 custom_summary 执行覆盖。custom_summary 为存档备注，前端建议 300 以内、API 硬限 350；超出时截断保存，存档照常落盘，不返回错误。payload_version 长度上限 100，超出返回 400。上传请求总大小由部署层自行处理，不在本契约中定义。加解密仅由前端承担；请求中不得包含用户独立加密密码或聊天明文。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {
+            "payload_version": "frontend-defined-payload-version",
+            "cipher_payload": {
+              "opaque": "前端管理的完整密文 JSON；后端仅原样保存，不解析其内容"
+            },
+            "custom_summary": "user-provided-summary-or-null"
+          },
+          "schema": {
+            "payload_version": {
+              "type": "string",
+              "required": true,
+              "description": "前端定义的密文 JSON 格式版本标识；长度上限 100，超出返回 400；后端仅存储和返回，不解释其语义。"
+            },
+            "cipher_payload": {
+              "type": "object",
+              "required": true,
+              "description": "前端管理的完整密文 JSON。后端不得解析、裁剪、合并、迁移、记录或回传明文。独立加密密码不得出现在此对象或任何请求中。"
+            },
+            "custom_summary": {
+              "type": "string",
+              "required": false,
+              "description": "存档备注，可选；可为空字符串或 null。前端建议 300 以内，API 硬限 350；超出时截断保存，存档照常落盘，不返回错误。后端仅原样保存和返回，不解析。未提供时，GET 与 GET /chat-data/info 返回 null。"
+            }
+          }
+        }
+      },
+      "response": [
+        {
+          "status": "200",
+          "body": {
+            "updated_at": "ISO-8601-time-string",
+            "custom_summary": "user-provided-summary-or-null"
+          },
+          "description": "密文 JSON 已全量覆盖保存；旧数据与旧概述不保留、不存历史副本。若 custom_summary 超长被截断，返回截断后的值。"
+        },
+        {
+          "status": "400",
+          "body": {
+            "error_code": "invalid_request",
+            "message": "请求体缺少必填字段、字段格式不可接受，或 payload_version 超出长度上限"
+          },
+          "description": "请求参数不合法。"
+        },
+        {
+          "status": "401",
+          "body": {
+            "error_code": "unauthenticated",
+            "message": "未认证"
+          },
+          "description": "受保护数据 API 未认证，由后端过滤器统一返回。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "服务端内部错误"
+          },
+          "description": "未预期服务端错误。"
+        }
+      ]
+    },
+    {
+      "path": "/chat-data",
+      "method": "DELETE",
+      "description": "直接物理删除当前会话主体已落盘的密文 JSON 数据集及其概述元数据。",
+      "detail": "本端点为受保护数据 API，未认证时由后端过滤器返回 401 JSON，不返回重定向或登录页。认证通过后，后端对已保存的密文 JSON 与 custom_summary 等元数据执行物理删除，不软删、不保留回收站、不保留历史副本、不生成导出文件。后端不解析密文内容。若当前无数据，按幂等处理返回 204。删除不可恢复。本接口不使 Keycloak 会话失效；登出使用 /auth/logout。",
+      "request": {
+        "query": {},
+        "head": {},
+        "body": {
+          "data": {},
+          "schema": {}
+        }
+      },
+      "response": [
+        {
+          "status": "204",
+          "body": {},
+          "description": "密文 JSON 与概述元数据已物理删除落盘，无响应体；不存在时同样返回 204。"
+        },
+        {
+          "status": "401",
+          "body": {
+            "error_code": "unauthenticated",
+            "message": "未认证"
+          },
+          "description": "受保护数据 API 未认证，由后端过滤器统一返回。"
+        },
+        {
+          "status": "500",
+          "body": {
+            "error_code": "internal_error",
+            "message": "服务端内部错误"
+          },
+          "description": "未预期服务端错误。"
+        }
+      ]
+    }
+  ]
+}
