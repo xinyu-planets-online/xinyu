@@ -1,359 +1,1683 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed, watch, shallowRef, onMounted } from 'vue'
+import { createClient } from '@inteye/llm-hub'
+import * as allProviders from '@inteye/llm-hub/providers'
+import { createCustomProvider } from '@inteye/llm-hub/providers'
 
-defineProps({
+const props = defineProps({
     showSettings: { type: Boolean, default: false },
     currentProvider: { type: String, default: '' },
     currentModel: { type: String, default: '' },
+    models: { type: Array, default: () => [] },
+    themeMode: { type: String, default: 'auto' },
+    userSystemPrompt: { type: String, default: '' },
 })
-defineEmits(['close'])
 
-const configEl = ref(null)
+const emit = defineEmits([
+    'close', 'update:themeMode', 'update:userSystemPrompt',
+    'switch-model', 'remove-model', 'add-model',
+])
 
-function getClient() {
-    return configEl.value?.client
+const CANDIDATE_NAMES = [
+    'openai', 'anthropic', 'gemini', 'deepseek', 'qwen', 'zhipu',
+    'moonshot', 'groq', 'minimax', 'mistral', 'baichuan', 'yi',
+    'step', 'stepfun', 'xai', 'ollama', 'lmstudio', 'localai',
+]
+
+const DISPLAY_NAME = {
+    openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini',
+    deepseek: 'DeepSeek', qwen: '通义千问', zhipu: '智谱 GLM',
+    moonshot: 'Moonshot', groq: 'Groq', minimax: 'MiniMax',
+    mistral: 'Mistral', baichuan: '百川', yi: '零一万物',
+    step: '阶跃星辰', stepfun: '阶跃星辰', xai: 'xAI',
+    ollama: 'Ollama', lmstudio: 'LM Studio', localai: 'LocalAI',
 }
 
+const BUILTIN_ADAPTERS = {}
+const BUILTIN = []
+for (const name of CANDIDATE_NAMES) {
+    const adapter = allProviders[name]
+    if (adapter && typeof adapter === 'object') {
+        BUILTIN_ADAPTERS[name] = adapter
+        if (!BUILTIN.includes(name)) BUILTIN.push(name)
+    }
+}
+
+const BUILTIN_MODELS = {
+    openai: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-4o', 'gpt-4o-mini'],
+    anthropic: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    gemini: ['gemini-3.1-pro-preview', 'gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
+    qwen: ['qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus', 'qwen3.6-flash'],
+    zhipu: ['glm-5.1', 'glm-5', 'glm-5-turbo', 'glm-4.7', 'glm-4.6'],
+    moonshot: ['kimi-k2.6', 'kimi-k2.5', 'kimi-k2-thinking', 'moonshot-v1-128k'],
+    groq: ['groq/compound', 'groq/compound-mini', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'],
+    minimax: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5'],
+    mistral: ['mistral-medium-3-5', 'mistral-large-2512', 'mistral-small-2603'],
+    baichuan: ['Baichuan4', 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k'],
+    yi: ['yi-large', 'yi-medium', 'yi-medium-200k', 'yi-spark'],
+    step: ['step-1-8k', 'step-1-32k', 'step-1-128k', 'step-2-16k'],
+    xai: ['grok-4.3', 'grok-4.3-latest', 'grok-4.1-fast'],
+    ollama: ['llama3.2', 'qwen2.5-coder:7b', 'deepseek-r1:8b'],
+    lmstudio: ['local-model'],
+    localai: ['local-model'],
+}
+
+const NO_KEY_REQUIRED = ['ollama', 'lmstudio', 'localai']
+
+// ============ 自定义端点持久化 ============
+const CUSTOM_ENDPOINTS_STORAGE_KEY = 'llm-hub-custom-endpoints'
+
+function loadCustomEndpoints() {
+    try {
+        const raw = localStorage.getItem(CUSTOM_ENDPOINTS_STORAGE_KEY)
+        return raw ? JSON.parse(raw) : []
+    } catch { return [] }
+}
+
+function persistCustomEndpoints() {
+    try {
+        localStorage.setItem(CUSTOM_ENDPOINTS_STORAGE_KEY, JSON.stringify(customEndpoints.value))
+    } catch { }
+}
+
+// 每个端点: { name, displayName, baseURL, apiKey, protocol, model }
+const customEndpoints = ref(loadCustomEndpoints())
+
+// ============ Client 创建（多自定义端点） ============
+const clientRef = shallowRef(null)
+
+async function buildClient() {
+    const providers = []
+
+    for (const name of BUILTIN) {
+        const p = BUILTIN_ADAPTERS[name]
+        if (p) providers.push(p)
+    }
+
+    for (const ep of customEndpoints.value) {
+        const adapter = createCustomProvider({
+            protocol: ep.protocol || 'openai',
+            name: ep.name,
+            displayName: ep.displayName || ep.name,
+            defaultBaseUrl: ep.baseURL,
+            models: ep.model
+                ? [{ id: ep.model, name: ep.model, supportsStreaming: true }]
+                : [],
+        })
+        providers.push(adapter)
+    }
+
+    const newClient = createClient({ storage: 'localStorage', providers })
+
+    for (const ep of customEndpoints.value) {
+        // ⚠️ 本地端点也传入一个非空占位 Key，避免被判定为“无 access”
+        const effectiveApiKey = ep.apiKey?.trim() || 'local-no-key'
+
+        await newClient.configure(ep.name, {
+            apiKey: effectiveApiKey,
+            baseUrl: ep.baseURL,
+            protocol: ep.protocol || 'openai',
+            defaultModel: ep.model || '',
+        })
+
+        // ===== 诊断：await 所有异步方法 =====
+        try {
+            const cfg = await newClient.getEffectiveConfig(ep.name)
+            console.log(`[DIAG][BUILD] getEffectiveConfig("${ep.name}"):`, cfg)
+        } catch (e) {
+            console.error(`[DIAG][BUILD] getEffectiveConfig threw:`, e)
+        }
+
+        try {
+            const access = await newClient.getProviderAccess(ep.name)
+            console.log(`[DIAG][BUILD] getProviderAccess("${ep.name}"):`, access)
+        } catch (e) {
+            console.error(`[DIAG][BUILD] getProviderAccess threw:`, e)
+        }
+
+        // 同步调用 getRequiredEffectiveConfig，看它是否抛错
+        try {
+            const reqCfg = newClient.getRequiredEffectiveConfig(ep.name)
+            console.log(`[DIAG][BUILD] getRequiredEffectiveConfig("${ep.name}"):`, reqCfg)
+        } catch (e) {
+            console.error(`[DIAG][BUILD] getRequiredEffectiveConfig threw:`, e)
+        }
+        // ===== 诊断结束 =====
+    }
+
+    clientRef.value = newClient
+    console.log('[DIAG][BUILD] clientRef assigned. endpoints:', customEndpoints.value.map(e => e.name))
+}
+
+onMounted(async () => {
+    await buildClient()
+})
+
+function getClient() { return clientRef.value }
 defineExpose({ getClient })
+
+function isBuiltin(id) { return BUILTIN.includes(id) }
+
+function displayName(id) {
+    if (isBuiltin(id)) return DISPLAY_NAME[id] || id
+    const ep = customEndpoints.value.find(e => e.name === id)
+    return ep ? (ep.displayName || ep.name) : id
+}
+
+function needsKey(provider) {
+    if (!provider) return true
+    if (customEndpoints.value.some(e => e.name === provider)) return false
+    return !NO_KEY_REQUIRED.includes(provider)
+}
+
+const view = ref('main')
+const activeTab = ref('model')
+const tabs = [
+    { key: 'model', label: '模型' },
+    { key: 'prompt', label: '提示词' },
+    { key: 'appearance', label: '外观' },
+]
+function switchTab(key) { activeTab.value = key; view.value = 'main' }
+function enterAdvanced() { view.value = 'advanced' }
+function backToMain() { view.value = 'main' }
+
+watch(() => props.showSettings, v => { if (v) view.value = 'main' })
+
+// ============ 模型拉取 ============
+const remoteModels = ref([])
+const modelsLoading = ref(false)
+const modelsError = ref('')
+
+async function fetchBuiltinModels(provider) {
+    if (!provider) return
+    modelsLoading.value = true
+    modelsError.value = ''
+    remoteModels.value = []
+    try {
+        if (typeof clientRef.value?.fetchModels === 'function') {
+            const raw = await clientRef.value.fetchModels(provider)
+            const list = (Array.isArray(raw) ? raw : [])
+                .map(m => {
+                    if (typeof m === 'string') return m
+                    if (m && m.id) return m.id
+                    if (m && m.name) return m.name
+                    return ''
+                }).filter(Boolean)
+            if (list.length) { remoteModels.value = list; return }
+        }
+    } catch (e) {
+        modelsError.value = '远端不可用，已使用内置列表'
+    } finally {
+        modelsLoading.value = false
+    }
+    remoteModels.value = BUILTIN_MODELS[provider] || []
+    if (!remoteModels.value.length) modelsError.value = '该 Provider 暂无预置模型，请手动输入'
+}
+
+async function fetchCustomModels() {
+    const baseURL = form.value.baseURL.trim().replace(/\/+$/, '')
+    const apiKey = form.value.apiKey.trim()
+    if (!baseURL) { modelsError.value = '先填 Base URL'; return }
+    modelsLoading.value = true
+    modelsError.value = ''
+    remoteModels.value = []
+    try {
+        const res = await fetch(`${baseURL}/models`, {
+            headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        const list = (data.data || []).map(m => m.id).filter(Boolean)
+        if (!list.length) throw new Error('返回空列表')
+        remoteModels.value = list
+    } catch (e) {
+        modelsError.value = e?.message || '拉取失败，可手动输入模型名'
+    } finally {
+        modelsLoading.value = false
+    }
+}
+
+// ============ 表单 ============
+const formOpen = ref(false)
+const editingItem = ref(null)
+const formError = ref('')
+const formBusy = ref(false)
+const testResult = ref('')
+const testOk = ref(false)
+const showKey = ref(false)
+
+const form = ref({
+    kind: 'builtin',
+    provider: '',
+    model: '',
+    apiKey: '',
+    baseURL: '',
+    protocol: 'openai',
+    customName: '',
+    displayName: '',
+})
+
+const availableModels = computed(() => remoteModels.value)
+
+watch(() => form.value.provider, async (id) => {
+    if (!id || form.value.kind !== 'builtin') return
+    await fetchBuiltinModels(id)
+    if (!form.value.model && remoteModels.value.length) form.value.model = remoteModels.value[0]
+})
+
+function resetForm() {
+    formError.value = ''
+    testResult.value = ''
+    testOk.value = false
+    showKey.value = false
+    remoteModels.value = []
+    modelsError.value = ''
+}
+
+function openAdd() {
+    formOpen.value = true
+    editingItem.value = null
+    form.value = {
+        kind: 'builtin', provider: '', model: '',
+        apiKey: '', baseURL: '', protocol: 'openai',
+        customName: '', displayName: '',
+    }
+    resetForm()
+}
+
+function openAddCustom() {
+    formOpen.value = true
+    editingItem.value = null
+    form.value = {
+        kind: 'custom',
+        provider: '',
+        model: '',
+        apiKey: '',
+        baseURL: '',
+        protocol: 'openai',
+        customName: `custom-${Date.now()}`,
+        displayName: '',
+    }
+    resetForm()
+}
+
+function openEdit(item) {
+    formOpen.value = true
+    editingItem.value = item
+
+    const isCustomEndpoint = customEndpoints.value.some(e => e.name === item.provider)
+    if (isCustomEndpoint) {
+        const ep = customEndpoints.value.find(e => e.name === item.provider)
+        form.value = {
+            kind: 'custom',
+            provider: ep.displayName || '',
+            model: ep.model,
+            apiKey: ep.apiKey || '',
+            baseURL: ep.baseURL,
+            protocol: ep.protocol || 'openai',
+            customName: ep.name,
+            displayName: ep.displayName || '',
+        }
+        resetForm()
+        return
+    }
+
+    form.value = {
+        kind: 'builtin',
+        provider: item.provider,
+        model: item.model,
+        apiKey: '', baseURL: '', protocol: 'openai',
+        customName: '', displayName: '',
+    }
+    resetForm()
+    if (item.provider) fetchBuiltinModels(item.provider)
+}
+
+function cancelForm() {
+    formOpen.value = false
+    editingItem.value = null
+    resetForm()
+}
+
+function switchKind(kind) {
+    if (form.value.kind === kind) return
+    form.value.kind = kind
+    form.value.provider = ''
+    form.value.model = ''
+    form.value.baseURL = ''
+    form.value.protocol = 'openai'
+    form.value.customName = kind === 'custom' ? `custom-${Date.now()}` : ''
+    form.value.displayName = ''
+    resetForm()
+}
+
+async function saveForm() {
+    formError.value = ''
+    const kind = form.value.kind
+    const model = form.value.model.trim()
+    const apiKey = form.value.apiKey.trim()
+    const baseURL = form.value.baseURL.trim().replace(/\/+$/, '')
+    const protocol = form.value.protocol || 'openai'
+
+    if (!model) { formError.value = '请选择或填写模型'; return }
+
+    formBusy.value = true
+    try {
+        if (kind === 'custom') {
+            if (!baseURL) { formError.value = '请填写 Base URL'; return }
+
+            const endpointData = {
+                name: form.value.customName,
+                displayName: form.value.provider.trim() || '自定义端点',
+                baseURL,
+                apiKey,
+                protocol,
+                model,
+            }
+
+            const existingIdx = customEndpoints.value.findIndex(e => e.name === endpointData.name)
+            if (existingIdx >= 0) {
+                customEndpoints.value[existingIdx] = {
+                    ...customEndpoints.value[existingIdx],
+                    ...endpointData,
+                    name: customEndpoints.value[existingIdx].name,
+                }
+            } else {
+                if (customEndpoints.value.some(e => e.name === endpointData.name)) {
+                    endpointData.name = `${endpointData.name}-${Date.now()}`
+                }
+                customEndpoints.value.push(endpointData)
+            }
+
+            persistCustomEndpoints()
+            await buildClient()
+
+            emit('add-model', {
+                provider: endpointData.name,
+                displayName: endpointData.displayName,
+                model: endpointData.model,
+                label: endpointData.displayName,
+                baseURL: endpointData.baseURL,
+                protocol: endpointData.protocol,
+            })
+        } else {
+            const provider = form.value.provider.trim()
+            if (!provider) { formError.value = '请选择 Provider'; return }
+            const payload = { defaultModel: model }
+            if (apiKey) payload.apiKey = apiKey
+            await clientRef.value.configure(provider, payload)
+
+            emit('add-model', {
+                provider,
+                displayName: displayName(provider),
+                model,
+                label: displayName(provider),
+            })
+        }
+
+        formOpen.value = false
+        editingItem.value = null
+    } catch (e) {
+        console.error('[save] 失败', e)
+        formError.value = e?.message || '保存失败'
+    } finally {
+        formBusy.value = false
+    }
+}
+
+async function testCurrent() {
+    testResult.value = ''
+    testOk.value = false
+    const kind = form.value.kind
+    const model = form.value.model.trim()
+    const apiKey = form.value.apiKey.trim()
+    const baseURL = form.value.baseURL.trim().replace(/\/+$/, '')
+    const protocol = form.value.protocol || 'openai'
+
+    if (!model) { testResult.value = '先选择模型'; return }
+    if (kind === 'builtin') { testResult.value = '内置 Provider 请保存后直接发消息验证'; return }
+    if (!baseURL) { testResult.value = '先填 Base URL'; return }
+
+    try {
+        const path = protocol === 'anthropic' ? '/messages' : '/chat/completions'
+        const res = await fetch(`${baseURL}${path}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            },
+            body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+        })
+        if (res.ok) { testResult.value = '连接成功'; testOk.value = true }
+        else {
+            const text = await res.text().catch(() => '')
+            testResult.value = `HTTP ${res.status} ${String(text).slice(0, 120)}`
+        }
+    } catch (e) {
+        testResult.value = e?.message || '无法连接'
+    }
+}
+
+function onSwitchModel(item) {
+    emit('switch-model', { provider: item.provider, model: item.model })
+}
+
+function onRemoveModel(item) {
+    if (window.confirm(`移除「${displayName(item.provider)} / ${item.model}」？`)) {
+        emit('remove-model', item.id)
+    }
+}
+
+async function onRemoveCustomEndpoint(ep) {
+    if (!window.confirm(`移除自定义端点「${ep.displayName || ep.name}」？`)) return
+    customEndpoints.value = customEndpoints.value.filter(e => e.name !== ep.name)
+    persistCustomEndpoints()
+    await buildClient()
+    emit('remove-model', ep.name)
+}
+
+// 提示词 & 外观
+const promptDraft = ref(props.userSystemPrompt)
+watch(() => props.userSystemPrompt, v => { promptDraft.value = v })
+let promptTimer = null
+function onPromptInput() {
+    clearTimeout(promptTimer)
+    promptTimer = setTimeout(() => { emit('update:userSystemPrompt', promptDraft.value) }, 300)
+}
+
+const themeOptions = [
+    { value: 'auto', label: '跟随系统', desc: '自动匹配系统外观' },
+    { value: 'light', label: '浅色', desc: '始终使用浅色主题' },
+    { value: 'dark', label: '深色', desc: '始终使用深色主题' },
+]
+function selectTheme(v) { emit('update:themeMode', v) }
 </script>
 
 <template>
-    <div class="mask" :class="{ show: showSettings }" @click="$emit('close')" />
+    <Teleport to="body">
+        <transition name="settings">
+            <div v-if="showSettings" class="settings-mask" :class="{ 'is-advanced': view === 'advanced' }"
+                @click.self="$emit('close')">
+                <div class="settings-panel" :class="{ 'is-advanced': view === 'advanced' }" role="dialog"
+                    aria-modal="true">
+                    <header class="settings-header">
+                        <div class="settings-header-left">
+                            <button v-if="view === 'advanced'" class="header-back" aria-label="返回" @click="backToMain">
+                                <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                                    <path d="M11 4L6 9l5 5" stroke="currentColor" stroke-width="1.6"
+                                        stroke-linecap="round" stroke-linejoin="round" />
+                                </svg>
+                            </button>
+                            <h2 class="settings-title">{{ view === 'advanced' ? '高级配置' : '设置' }}</h2>
+                        </div>
+                        <button class="settings-close" aria-label="关闭" @click="$emit('close')">
+                            <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                                <path d="M5 5L13 13M13 5L5 13" stroke="currentColor" stroke-width="1.6"
+                                    stroke-linecap="round" />
+                            </svg>
+                        </button>
+                    </header>
 
-    <aside class="drawer" :class="{ show: showSettings }">
-        <header class="drawer-header">
-            <div class="drawer-heading">
-                <h2 class="drawer-title">设置</h2>
-                <p class="drawer-subtitle">配置模型与 API Key</p>
-            </div>
-            <button class="drawer-close" aria-label="关闭" @click="$emit('close')">
-                <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                    <path d="M5 5L13 13M13 5L5 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-                </svg>
-            </button>
-        </header>
+                    <template v-if="view === 'main'">
+                        <nav class="settings-tabs" role="tablist">
+                            <button v-for="t in tabs" :key="t.key" class="settings-tab"
+                                :class="{ active: activeTab === t.key }" role="tab" :aria-selected="activeTab === t.key"
+                                @click="switchTab(t.key)">{{ t.label }}</button>
+                        </nav>
 
-        <div class="drawer-body">
-            <div class="current-card">
-                <div class="current-label">当前模型</div>
-                <div class="current-value">
-                    <template v-if="currentProvider">
-                        <span class="current-provider">{{ currentProvider }}</span>
-                        <span v-if="currentModel" class="current-divider">/</span>
-                        <span v-if="currentModel" class="current-model">{{ currentModel }}</span>
+                        <div class="settings-body">
+                            <section v-if="activeTab === 'model'" class="tab-pane">
+                                <header class="pane-head">
+                                    <h3 class="pane-title">模型</h3>
+                                    <p class="pane-desc">点击切换，右侧编辑或移除</p>
+                                </header>
+
+                                <div v-if="models.length" class="model-list">
+                                    <div v-for="item in models" :key="item.id" class="model-item"
+                                        :class="{ active: item.provider === currentProvider && item.model === currentModel }">
+                                        <button class="model-item-main" @click="onSwitchModel(item)">
+                                            <span class="model-provider">{{ displayName(item.provider) }}</span>
+                                            <span class="model-sep">/</span>
+                                            <span class="model-name">{{ item.model }}</span>
+                                            <span
+                                                v-if="item.provider === currentProvider && item.model === currentModel"
+                                                class="model-badge">使用中</span>
+                                        </button>
+                                        <div class="model-item-actions">
+                                            <button class="icon-btn" title="编辑" @click.stop="openEdit(item)"><svg
+                                                    viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                                    <path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" stroke="currentColor"
+                                                        stroke-width="1.4" stroke-linejoin="round" />
+                                                </svg></button>
+                                            <button class="icon-btn danger" title="移除"
+                                                @click.stop="onRemoveModel(item)"><svg viewBox="0 0 16 16" fill="none"
+                                                    aria-hidden="true">
+                                                    <path
+                                                        d="M3.5 4.5h9M6.5 4.5V3a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1.5M5 4.5l.5 8a.5.5 0 00.5.5h4a.5.5 0 00.5-.5l.5-8"
+                                                        stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
+                                                        stroke-linejoin="round" />
+                                                </svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div v-else-if="!formOpen" class="empty-state">
+                                    <p class="empty-text">还没有添加模型</p>
+                                    <p class="empty-hint">点击下方“添加模型”或“添加自定义端点”开始</p>
+                                </div>
+
+                                <div class="custom-endpoints-section">
+                                    <header class="pane-head" style="margin-top: 0.5rem;">
+                                        <h4 class="pane-title" style="font-size: 0.875rem;">自定义端点</h4>
+                                        <p class="pane-desc">可添加多个 OpenAI / Anthropic 兼容端点</p>
+                                    </header>
+
+                                    <div v-if="customEndpoints.length" class="custom-endpoint-list">
+                                        <div v-for="ep in customEndpoints" :key="ep.name" class="custom-endpoint-item">
+                                            <div class="custom-endpoint-info">
+                                                <span class="custom-endpoint-name">{{ ep.displayName || ep.name
+                                                    }}</span>
+                                                <span class="custom-endpoint-url">{{ ep.baseURL }}</span>
+                                                <span class="custom-endpoint-model">{{ ep.model }}</span>
+                                            </div>
+                                            <div class="custom-endpoint-actions">
+                                                <button class="icon-btn" title="编辑"
+                                                    @click="openEdit({ provider: ep.name, model: ep.model })">
+                                                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                                        <path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" stroke="currentColor"
+                                                            stroke-width="1.4" stroke-linejoin="round" />
+                                                    </svg>
+                                                </button>
+                                                <button class="icon-btn danger" title="移除"
+                                                    @click="onRemoveCustomEndpoint(ep)">
+                                                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                                        <path
+                                                            d="M3.5 4.5h9M6.5 4.5V3a.5.5 0 01.5-.5h2a.5.5 0 01.5.5v1.5M5 4.5l.5 8a.5.5 0 00.5.5h4a.5.5 0 00.5-.5l.5-8"
+                                                            stroke="currentColor" stroke-width="1.4"
+                                                            stroke-linecap="round" stroke-linejoin="round" />
+                                                    </svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <p v-else class="empty-hint" style="font-size: 0.75rem;">尚未添加自定义端点</p>
+                                </div>
+
+                                <form v-if="formOpen" class="add-form" @submit.prevent="saveForm">
+                                    <div class="add-form-head">
+                                        <span class="add-form-title">{{ editingItem ? '编辑' : '添加' }}{{
+                                            form.kind === 'custom' ? '自定义端点' : '模型' }}</span>
+                                        <button type="button" class="add-form-close" aria-label="关闭"
+                                            @click="cancelForm">
+                                            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                                <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4"
+                                                    stroke-linecap="round" />
+                                            </svg>
+                                        </button>
+                                    </div>
+
+                                    <div v-if="!editingItem" class="segmented">
+                                        <button type="button" class="segment"
+                                            :class="{ active: form.kind === 'builtin' }"
+                                            @click="switchKind('builtin')">内置 Provider</button>
+                                        <button type="button" class="segment"
+                                            :class="{ active: form.kind === 'custom' }"
+                                            @click="switchKind('custom')">自定义端点</button>
+                                    </div>
+
+                                    <template v-if="form.kind === 'builtin'">
+                                        <label class="field">
+                                            <span class="field-label">Provider <span class="req">*</span></span>
+                                            <select v-model="form.provider" class="field-select">
+                                                <option value="" disabled>请选择</option>
+                                                <option v-for="p in BUILTIN" :key="p" :value="p">{{ displayName(p) }}
+                                                </option>
+                                            </select>
+                                        </label>
+                                        <label class="field">
+                                            <span class="field-label">模型 <span class="req">*</span>
+                                                <span v-if="modelsLoading" class="field-hint-inline">（拉取中…）</span>
+                                                <span v-else-if="modelsError" class="field-hint-inline">（{{ modelsError
+                                                    }}）</span>
+                                            </span>
+                                            <div v-if="availableModels.length" class="field-row">
+                                                <select v-model="form.model" class="field-select">
+                                                    <option value="" disabled>请选择模型</option>
+                                                    <option v-for="m in availableModels" :key="m" :value="m">{{ m }}
+                                                    </option>
+                                                </select>
+                                            </div>
+                                            <div v-else class="field-row">
+                                                <input v-model="form.model" class="field-input"
+                                                    :placeholder="modelsLoading ? '拉取中…' : '输入模型名'" autocomplete="off"
+                                                    spellcheck="false" />
+                                            </div>
+                                        </label>
+                                    </template>
+
+                                    <template v-else>
+                                        <label class="field">
+                                            <span class="field-label">显示名称 <span
+                                                    class="opt">（选填，留空显示“自定义端点”）</span></span>
+                                            <input v-model="form.displayName" class="field-input"
+                                                placeholder="例如：我的本地代理" autocomplete="off" spellcheck="false" />
+                                        </label>
+                                        <label class="field">
+                                            <span class="field-label">Base URL <span class="req">*</span></span>
+                                            <input v-model="form.baseURL" class="field-input"
+                                                placeholder="https://your-endpoint.com/v1" autocomplete="off"
+                                                spellcheck="false" />
+                                        </label>
+                                        <label class="field">
+                                            <span class="field-label">协议 <span class="req">*</span></span>
+                                            <select v-model="form.protocol" class="field-select">
+                                                <option value="openai">OpenAI 兼容（/chat/completions）</option>
+                                                <option value="anthropic">Anthropic 兼容（/messages）</option>
+                                            </select>
+                                        </label>
+                                        <label class="field">
+                                            <span class="field-label">模型 <span class="req">*</span>
+                                                <span v-if="modelsLoading" class="field-hint-inline">（拉取中…）</span>
+                                                <span v-else-if="modelsError" class="field-hint-inline">（{{ modelsError
+                                                    }}）</span>
+                                            </span>
+                                            <div class="field-row">
+                                                <select v-if="availableModels.length" v-model="form.model"
+                                                    class="field-select">
+                                                    <option value="" disabled>请选择模型</option>
+                                                    <option v-for="m in availableModels" :key="m" :value="m">{{ m }}
+                                                    </option>
+                                                </select>
+                                                <input v-else v-model="form.model" class="field-input"
+                                                    :placeholder="modelsLoading ? '拉取中…' : '输入模型名'" autocomplete="off"
+                                                    spellcheck="false" />
+                                                <button type="button" class="field-toggle"
+                                                    @click="fetchCustomModels">拉取模型</button>
+                                            </div>
+                                        </label>
+                                    </template>
+
+                                    <label class="field">
+                                        <span class="field-label">API Key
+                                            <span v-if="form.kind === 'custom'" class="opt">（选填）</span>
+                                            <span v-else-if="needsKey(form.provider)" class="req">*</span>
+                                            <span v-else class="opt">（选填）</span>
+                                            <span v-if="editingItem" class="field-hint-inline">（留空表示不修改）</span>
+                                        </span>
+                                        <div class="field-row">
+                                            <input v-model="form.apiKey" class="field-input"
+                                                :type="showKey ? 'text' : 'password'" placeholder="sk-..."
+                                                autocomplete="off" spellcheck="false" />
+                                            <button type="button" class="field-toggle" @click="showKey = !showKey">{{
+                                                showKey ? '隐藏' : '显示' }}</button>
+                                        </div>
+                                    </label>
+
+                                    <p v-if="formError" class="form-error">{{ formError }}</p>
+
+                                    <div v-if="form.kind === 'custom'" class="test-row">
+                                        <button type="button" class="btn-ghost" @click="testCurrent">测试连接</button>
+                                        <span v-if="testResult" class="test-result" :class="{ ok: testOk }">{{
+                                            testResult }}</span>
+                                    </div>
+
+                                    <div class="add-form-actions">
+                                        <button type="button" class="btn-ghost" @click="cancelForm">取消</button>
+                                        <button type="submit" class="btn-primary" :disabled="formBusy">
+                                            {{ formBusy ? '保存中…' : '保存' }}
+                                        </button>
+                                    </div>
+                                </form>
+
+                                <div v-if="!formOpen" class="bottom-actions">
+                                    <button class="add-model-btn" @click="openAdd">
+                                        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                            <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6"
+                                                stroke-linecap="round" />
+                                        </svg>
+                                        添加内置模型
+                                    </button>
+                                    <button class="add-model-btn" @click="openAddCustom">
+                                        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                            <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6"
+                                                stroke-linecap="round" />
+                                        </svg>
+                                        添加自定义端点
+                                    </button>
+                                </div>
+
+                                <button class="advanced-btn" @click="enterAdvanced">高级配置（Token Plan / 调试台）</button>
+                                <p class="model-hint">API Key 仅保存在本机浏览器，不会上传。</p>
+                            </section>
+
+                            <section v-if="activeTab === 'prompt'" class="tab-pane">
+                                <header class="pane-head">
+                                    <h3 class="pane-title">用户级系统提示词</h3>
+                                    <p class="pane-desc">对所有对话生效，用于定义你的偏好，例如称呼、回答风格、语言</p>
+                                </header>
+                                <textarea v-model="promptDraft" class="prompt-input" rows="10"
+                                    placeholder="例如：请称呼我为小王，回答尽量详细，优先使用中文。" @input="onPromptInput" />
+                                <div class="note">
+                                    <p>应用级提示词由开发者维护，不可在此修改。会话级提示词在对话树中单独设置。</p>
+                                    <p>三层提示词会在每次请求时合并为一条系统消息发送给模型。</p>
+                                </div>
+                            </section>
+
+                            <section v-if="activeTab === 'appearance'" class="tab-pane">
+                                <header class="pane-head">
+                                    <h3 class="pane-title">主题</h3>
+                                    <p class="pane-desc">选择界面配色方案</p>
+                                </header>
+                                <div class="theme-list">
+                                    <button v-for="opt in themeOptions" :key="opt.value" class="theme-option"
+                                        :class="{ active: themeMode === opt.value }" @click="selectTheme(opt.value)">
+                                        <span class="theme-preview" :data-theme-preview="opt.value" />
+                                        <span class="theme-text">
+                                            <span class="theme-label">{{ opt.label }}</span>
+                                            <span class="theme-desc">{{ opt.desc }}</span>
+                                        </span>
+                                        <span class="theme-check">
+                                            <svg v-if="themeMode === opt.value" viewBox="0 0 16 16" fill="none"
+                                                aria-hidden="true">
+                                                <path d="M3.5 8.5l3 3 6-6" stroke="currentColor" stroke-width="1.6"
+                                                    stroke-linecap="round" stroke-linejoin="round" />
+                                            </svg>
+                                        </span>
+                                    </button>
+                                </div>
+                            </section>
+                        </div>
                     </template>
-                    <span v-else class="current-empty">尚未选择</span>
+
+                    <div v-else class="settings-body advanced-body">
+                        <llm-hub-config storage="localStorage" locale="zh" />
+                    </div>
                 </div>
             </div>
-
-            <section class="config-section">
-                <div class="section-head">
-                    <h3 class="section-title">Provider 配置</h3>
-                    <p class="section-desc">填写你自己的 API Key，选择 Provider 与模型</p>
-                </div>
-                <div class="config-panel">
-                    <llm-hub-config ref="configEl" storage="localStorage" locale="zh" show-debug />
-                </div>
-            </section>
-        </div>
-
-        <footer class="drawer-footer">
-            <button class="btn-secondary" @click="$emit('close')">取消</button>
-            <button class="btn-primary" @click="$emit('close')">完成</button>
-        </footer>
-    </aside>
+        </transition>
+    </Teleport>
 </template>
 
 <style scoped>
-.mask {
+/* 原有样式全部保留 */
+.custom-endpoints-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--acu-border);
+}
+
+.custom-endpoint-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.custom-endpoint-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.625rem 0.875rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.625rem;
+}
+
+.custom-endpoint-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    min-width: 0;
+}
+
+.custom-endpoint-name {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--acu-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.custom-endpoint-url {
+    font-size: 0.6875rem;
+    color: var(--acu-text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.custom-endpoint-model {
+    font-size: 0.6875rem;
+    color: var(--acu-primary);
+}
+
+.custom-endpoint-actions {
+    display: flex;
+    gap: 0.125rem;
+    flex: 0 0 auto;
+}
+
+.bottom-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.bottom-actions .add-model-btn {
+    flex: 1;
+}
+
+/* 其余原有样式保持不变，为节省篇幅省略，请保留你文件中的全部原有样式 */
+.settings-mask {
     position: fixed;
     inset: 0;
-    z-index: 40;
-    background: var(--mask);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.35s ease;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(2px);
+    transition: padding 0.2s ease;
 }
 
-.mask.show {
-    opacity: 1;
-    pointer-events: auto;
+.settings-mask.is-advanced {
+    padding: 0;
 }
 
-.drawer {
-    position: fixed;
-    top: 0;
-    right: 0;
-    z-index: 50;
-    height: 100vh;
-    height: 100dvh;
-    width: 42vw;
-    min-width: 0;
-    box-sizing: border-box;
+.settings-panel {
+    width: min(52rem, 100%);
+    height: min(85vh, 44rem);
     display: flex;
     flex-direction: column;
     background: var(--acu-bg);
-    border-left: 0.0625rem solid var(--acu-border);
-    box-shadow: var(--drawer-shadow);
-    transform: translateX(105%);
-    transition: transform 0.42s cubic-bezier(0.22, 0.8, 0.24, 1);
+    border: 1px solid var(--acu-border);
+    border-radius: 1rem;
+    box-shadow: var(--acu-shadow-lg);
+    overflow: hidden;
+    transition: width 0.2s ease, height 0.2s ease, border-radius 0.2s ease;
 }
 
-.drawer.show {
-    transform: translateX(0);
+.settings-panel.is-advanced {
+    width: 100vw;
+    height: 100vh;
+    max-width: none;
+    max-height: none;
+    border-radius: 0;
+    border: none;
 }
 
-.drawer-header {
+.settings-header {
     flex: 0 0 auto;
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
-    gap: clamp(0.75rem, 1.6vw, 1rem);
-    padding: clamp(1rem, 2.4vh, 1.5rem) clamp(1rem, 2.4vw, 1.5rem) clamp(0.75rem, 1.8vh, 1.25rem);
-    border-bottom: 0.0625rem solid var(--acu-border);
+    gap: 1rem;
+    padding: 1.125rem 1.5rem;
+    border-bottom: 1px solid var(--acu-border);
 }
 
-.drawer-heading {
+.settings-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     min-width: 0;
 }
 
-.drawer-title {
-    margin: 0 0 0.25rem;
-    font-size: clamp(1rem, 0.9rem + 0.4vw, 1.125rem);
+.header-back {
+    width: 1.75rem;
+    height: 1.75rem;
+    display: grid;
+    place-items: center;
+    color: var(--acu-text-secondary);
+    background: transparent;
+    border: 1px solid var(--acu-border);
+    border-radius: 0.4375rem;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.header-back svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.header-back:hover {
+    color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+    border-color: var(--acu-primary-soft);
+}
+
+.settings-title {
+    margin: 0;
+    font-size: 1.0625rem;
     font-weight: 600;
     letter-spacing: 0.02em;
     color: var(--acu-text);
+    white-space: nowrap;
 }
 
-.drawer-subtitle {
-    margin: 0;
-    font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
-    color: var(--acu-text-muted);
-}
-
-.drawer-close {
+.settings-close {
     flex: 0 0 auto;
-    width: clamp(1.75rem, 2.8vw, 2rem);
-    height: clamp(1.75rem, 2.8vw, 2rem);
+    width: 2rem;
+    height: 2rem;
     display: grid;
     place-items: center;
     color: var(--acu-text-muted);
     background: transparent;
-    border: 0.0625rem solid var(--acu-border);
-    border-radius: 0.625rem;
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
     cursor: pointer;
     transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
-.drawer-close svg {
+.settings-close svg {
     width: 1.125em;
     height: 1.125em;
 }
 
-.drawer-close:hover {
+.settings-close:hover {
     color: var(--acu-text);
     background: var(--acu-surface-2);
     border-color: var(--acu-border-strong);
 }
 
-.drawer-body {
+.settings-tabs {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 0.25rem;
+    padding: 0 1.5rem;
+    border-bottom: 1px solid var(--acu-border);
+}
+
+.settings-tab {
+    position: relative;
+    padding: 0.75rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--acu-text-muted);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: color 0.15s ease;
+}
+
+.settings-tab:hover {
+    color: var(--acu-text-secondary);
+}
+
+.settings-tab.active {
+    color: var(--acu-primary);
+}
+
+.settings-tab.active::after {
+    content: '';
+    position: absolute;
+    left: 0.75rem;
+    right: 0.75rem;
+    bottom: -1px;
+    height: 2px;
+    background: var(--acu-primary);
+    border-radius: 2px 2px 0 0;
+}
+
+.settings-body {
     flex: 1 1 auto;
     min-height: 0;
-    min-width: 0;
     overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: clamp(0.75rem, 2vh, 1.25rem);
-    padding: clamp(0.875rem, 2.2vh, 1.5rem) clamp(1rem, 2.4vw, 1.5rem);
+    padding: 1.5rem;
     scrollbar-width: thin;
     scrollbar-color: var(--acu-border-strong) transparent;
 }
 
-.drawer-body::-webkit-scrollbar {
+.settings-body::-webkit-scrollbar {
     width: 0.375rem;
 }
 
-.drawer-body::-webkit-scrollbar-thumb {
+.settings-body::-webkit-scrollbar-thumb {
     background: var(--acu-border-strong);
     border-radius: 999rem;
 }
 
-.drawer-body>* {
-    flex: 0 0 auto;
-    min-width: 0;
+.advanced-body {
+    padding: 2rem;
 }
 
-.current-card {
-    box-sizing: border-box;
+.advanced-body>* {
+    display: block;
     width: 100%;
     min-width: 0;
-    padding: clamp(0.75rem, 1.8vh, 1rem) clamp(0.875rem, 2vw, 1.125rem);
-    background: var(--acu-surface);
-    border: 0.0625rem solid var(--acu-border);
-    border-radius: 0.875rem;
 }
 
-.current-label {
-    font-size: clamp(0.625rem, 0.6rem + 0.1vw, 0.6875rem);
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+.tab-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.pane-head {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.pane-title {
+    margin: 0;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--acu-text);
+}
+
+.pane-desc {
+    margin: 0;
+    font-size: 0.8125rem;
+    line-height: 1.65;
     color: var(--acu-text-muted);
-    margin-bottom: clamp(0.375rem, 0.9vh, 0.5rem);
 }
 
-.current-value {
+.model-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.model-item {
+    display: flex;
+    align-items: stretch;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.75rem;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.model-item:hover {
+    border-color: var(--acu-border-strong);
+}
+
+.model-item.active {
+    border-color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+}
+
+.model-item-main {
+    flex: 1 1 auto;
+    min-width: 0;
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: clamp(0.375rem, 0.8vw, 0.5rem);
-    font-size: clamp(0.8125rem, 0.78rem + 0.2vw, 0.875rem);
-    font-weight: 500;
+    gap: 0.375rem;
+    padding: 0.875rem 1rem;
+    font-size: 0.8125rem;
     color: var(--acu-text);
-    min-width: 0;
-    word-break: break-word;
+    background: transparent;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 0.75rem 0 0 0.75rem;
 }
 
-.current-provider {
-    padding: 0.1875rem 0.625rem;
-    font-size: clamp(0.75rem, 0.72rem + 0.15vw, 0.8125rem);
+.model-provider {
+    padding: 0.125rem 0.4375rem;
+    font-size: 0.75rem;
     color: var(--acu-primary);
     background: var(--acu-primary-soft);
-    border-radius: 0.375rem;
-    max-width: 100%;
-    overflow-wrap: anywhere;
+    border-radius: 0.25rem;
 }
 
-.current-divider {
+.model-item.active .model-provider {
+    background: var(--acu-primary-soft-hover);
+}
+
+.model-sep {
     color: var(--acu-text-muted);
-    font-weight: 400;
 }
 
-.current-empty {
-    color: var(--acu-text-muted);
-    font-weight: 400;
-}
-
-.config-section {
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: clamp(0.5rem, 1vh, 0.75rem);
-}
-
-.section-head {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1875rem;
-    min-width: 0;
-}
-
-.section-title {
-    margin: 0;
-    font-size: clamp(0.8125rem, 0.78rem + 0.2vw, 0.875rem);
-    font-weight: 600;
-    letter-spacing: 0.02em;
+.model-name {
     color: var(--acu-text);
+    word-break: break-all;
 }
 
-.section-desc {
-    margin: 0;
-    font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
-    line-height: 1.6;
-    color: var(--acu-text-muted);
+.model-badge {
+    margin-left: auto;
+    padding: 0.0625rem 0.4375rem;
+    font-size: 0.6875rem;
+    font-weight: 500;
+    color: var(--acu-primary);
+    background: var(--acu-primary-soft-hover);
+    border-radius: 999rem;
 }
 
-.config-panel {
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    background: var(--acu-surface);
-    border: 0.0625rem solid var(--acu-border);
-    border-radius: 0.875rem;
-}
-
-.config-panel>* {
-    display: block;
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-}
-
-.drawer-footer {
+.model-item-actions {
     flex: 0 0 auto;
     display: flex;
-    justify-content: flex-end;
-    gap: clamp(0.5rem, 1vw, 0.75rem);
-    padding: clamp(0.75rem, 1.8vh, 1rem) clamp(1rem, 2.4vw, 1.5rem);
-    border-top: 0.0625rem solid var(--acu-border);
-    background: var(--acu-bg);
+    align-items: center;
+    gap: 0.125rem;
+    padding-right: 0.375rem;
 }
 
-.btn-secondary,
-.btn-primary {
-    height: clamp(2rem, 4vh, 2.375rem);
-    padding: 0 clamp(0.875rem, 1.6vw, 1.25rem);
-    font-size: clamp(0.8125rem, 0.78rem + 0.2vw, 0.875rem);
-    font-weight: 500;
-    letter-spacing: 0.04em;
-    border-radius: 0.625rem;
+.icon-btn {
+    width: 1.75rem;
+    height: 1.75rem;
+    display: grid;
+    place-items: center;
+    color: var(--acu-text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 0.375rem;
     cursor: pointer;
-    transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    transition: background 0.15s ease, color 0.15s ease;
 }
 
-.btn-secondary {
+.icon-btn svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.icon-btn:hover {
+    color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+}
+
+.icon-btn.danger:hover {
+    color: var(--acu-error);
+    background: var(--acu-error-soft);
+}
+
+.add-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.875rem;
+    padding: 1rem 1.125rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.75rem;
+}
+
+.add-form-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.25rem;
+}
+
+.add-form-title {
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--acu-text);
+}
+
+.add-form-close {
+    width: 1.5rem;
+    height: 1.5rem;
+    display: grid;
+    place-items: center;
+    color: var(--acu-text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 0.375rem;
+    cursor: pointer;
+}
+
+.add-form-close svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.add-form-close:hover {
+    color: var(--acu-error);
+    background: var(--acu-error-soft);
+}
+
+.segmented {
+    display: flex;
+    padding: 0.1875rem;
+    background: var(--acu-bg);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+    gap: 0.1875rem;
+}
+
+.segment {
+    flex: 1 1 0;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
     color: var(--acu-text-secondary);
     background: transparent;
-    border: 0.0625rem solid var(--acu-border);
+    border: none;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
 }
 
-.btn-secondary:hover {
+.segment.active {
+    color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+}
+
+.segment:hover:not(.active) {
     color: var(--acu-text);
-    background: var(--acu-surface-2);
-    border-color: var(--acu-border-strong);
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.field-label {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--acu-text-secondary);
+}
+
+.req {
+    color: var(--acu-error);
+    font-weight: 600;
+}
+
+.opt {
+    color: var(--acu-text-muted);
+    font-weight: 400;
+}
+
+.field-hint-inline {
+    color: var(--acu-text-muted);
+    font-weight: 400;
+}
+
+.field-input,
+.field-select {
+    width: 100%;
+    box-sizing: border-box;
+    height: 2.375rem;
+    padding: 0 0.75rem;
+    font-family: inherit;
+    font-size: 0.8125rem;
+    color: var(--acu-text);
+    background: var(--acu-bg);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.field-select {
+    appearance: none;
+    padding-right: 2rem;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M4 6l4 4 4-4' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.625rem center;
+    background-size: 1rem;
+    cursor: pointer;
+}
+
+.field-input:focus,
+.field-select:focus {
+    border-color: var(--acu-primary);
+    box-shadow: 0 0 0 3px var(--acu-primary-soft);
+}
+
+.field-input:disabled,
+.field-select:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.field-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.field-row .field-input {
+    flex: 1 1 auto;
+}
+
+.field-toggle {
+    flex: 0 0 auto;
+    height: 2.375rem;
+    padding: 0 0.875rem;
+    font-size: 0.75rem;
+    color: var(--acu-text-secondary);
+    background: var(--acu-bg);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.field-toggle:hover {
+    color: var(--acu-primary);
+    border-color: var(--acu-primary);
+}
+
+.form-error {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--acu-error);
+}
+
+.test-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.test-result {
+    font-size: 0.75rem;
+    color: var(--acu-error);
+    word-break: break-all;
+}
+
+.test-result.ok {
+    color: var(--acu-success);
+}
+
+.add-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding-top: 0.25rem;
+}
+
+.btn-primary,
+.btn-ghost {
+    height: 2.25rem;
+    padding: 0 1rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
 .btn-primary {
     color: var(--acu-primary-contrast);
     background: var(--acu-primary);
-    border: 0.0625rem solid transparent;
+    border: 1px solid var(--acu-primary);
 }
 
 .btn-primary:hover {
     background: var(--acu-primary-hover);
+    border-color: var(--acu-primary-hover);
 }
 
-@media (max-width: 64rem) {
-    .drawer {
-        width: 60vw;
-    }
+.btn-primary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.btn-ghost {
+    color: var(--acu-text-secondary);
+    background: transparent;
+    border: 1px solid var(--acu-border);
+}
+
+.btn-ghost:hover {
+    color: var(--acu-text);
+    background: var(--acu-surface);
+    border-color: var(--acu-border-strong);
+}
+
+.add-model-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    padding: 0.875rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--acu-text-secondary);
+    background: transparent;
+    border: 1px dashed var(--acu-border-strong);
+    border-radius: 0.75rem;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.add-model-btn svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.add-model-btn:hover {
+    color: var(--acu-primary);
+    border-color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+}
+
+.advanced-btn {
+    align-self: flex-start;
+    padding: 0.375rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--acu-text-muted);
+    background: transparent;
+    border: 1px solid var(--acu-border);
+    border-radius: 0.375rem;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.advanced-btn:hover {
+    color: var(--acu-primary);
+    border-color: var(--acu-primary);
+}
+
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 1.5rem 1rem;
+    text-align: center;
+}
+
+.empty-text {
+    margin: 0;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--acu-text);
+}
+
+.empty-hint {
+    margin: 0;
+    font-size: 0.8125rem;
+    color: var(--acu-text-muted);
+}
+
+.model-hint {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--acu-text-muted);
+}
+
+.prompt-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.875rem 1.125rem;
+    font-family: inherit;
+    font-size: 0.875rem;
+    line-height: 1.7;
+    color: var(--acu-text);
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.75rem;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.prompt-input:focus {
+    border-color: var(--acu-primary);
+    box-shadow: 0 0 0 3px var(--acu-primary-soft);
+}
+
+.prompt-input::placeholder {
+    color: var(--acu-text-muted);
+}
+
+.note {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.875rem 1.125rem;
+    background: var(--acu-surface);
+    border-radius: 0.75rem;
+}
+
+.note p {
+    margin: 0;
+    font-size: 0.8125rem;
+    line-height: 1.65;
+    color: var(--acu-text-muted);
+}
+
+.theme-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.theme-option {
+    display: flex;
+    align-items: center;
+    gap: 0.875rem;
+    padding: 0.875rem 1.125rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.75rem;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.theme-option:hover {
+    border-color: var(--acu-border-strong);
+}
+
+.theme-option.active {
+    border-color: var(--acu-primary);
+    background: var(--acu-primary-soft);
+}
+
+.theme-preview {
+    flex: 0 0 auto;
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--acu-border);
+}
+
+.theme-preview[data-theme-preview='light'] {
+    background: #f8f0e4;
+}
+
+.theme-preview[data-theme-preview='dark'] {
+    background: #15181d;
+}
+
+.theme-preview[data-theme-preview='auto'] {
+    background: linear-gradient(135deg, #f8f0e4 0 50%, #15181d 50% 100%);
+}
+
+.theme-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1875rem;
+}
+
+.theme-label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--acu-text);
+}
+
+.theme-desc {
+    font-size: 0.75rem;
+    color: var(--acu-text-muted);
+}
+
+.theme-check {
+    flex: 0 0 auto;
+    width: 1.25rem;
+    height: 1.25rem;
+    display: grid;
+    place-items: center;
+    color: var(--acu-primary);
+}
+
+.theme-check svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.settings-enter-active,
+.settings-leave-active {
+    transition: opacity 0.2s ease;
+}
+
+.settings-enter-active .settings-panel,
+.settings-leave-active .settings-panel {
+    transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.settings-enter-from,
+.settings-leave-to {
+    opacity: 0;
+}
+
+.settings-enter-from .settings-panel,
+.settings-leave-to .settings-panel {
+    opacity: 0;
+    transform: scale(0.97);
 }
 
 @media (max-width: 48rem) {
-    .drawer {
-        width: 100vw;
-        border-left: none;
+    .settings-mask {
+        padding: 0;
     }
 
-    .drawer-header {
-        padding: clamp(0.875rem, 2.2vh, 1.25rem) clamp(0.875rem, 3vw, 1.125rem) clamp(0.625rem, 1.6vh, 1rem);
+    .settings-mask.is-advanced {
+        padding: 0;
     }
 
-    .drawer-body {
-        padding: clamp(0.75rem, 1.8vh, 1rem) clamp(0.875rem, 3vw, 1.125rem);
+    .settings-panel {
+        width: 100%;
+        height: 100%;
+        max-height: 100%;
+        border-radius: 0;
+        border: none;
     }
 
-    .drawer-footer {
-        padding: clamp(0.625rem, 1.6vh, 1rem) clamp(0.875rem, 3vw, 1.125rem);
+    .settings-header,
+    .settings-tabs,
+    .settings-body {
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    .advanced-body {
+        padding: 1rem;
     }
 }
 
 @media (prefers-reduced-motion: reduce) {
 
-    .drawer,
-    .mask {
+    .settings-enter-active,
+    .settings-leave-active,
+    .settings-enter-active .settings-panel,
+    .settings-leave-active .settings-panel {
         transition: none;
     }
 }
