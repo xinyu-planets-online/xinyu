@@ -111,7 +111,7 @@ async function buildClient() {
     const newClient = createClient({ storage: 'localStorage', providers })
 
     for (const ep of customEndpoints.value) {
-        // ⚠️ 本地端点也传入一个非空占位 Key，避免被判定为“无 access”
+        // 本地端点也传入一个非空占位 Key，避免被判定为“无 access”
         const effectiveApiKey = ep.apiKey?.trim() || 'local-no-key'
 
         await newClient.configure(ep.name, {
@@ -120,34 +120,9 @@ async function buildClient() {
             protocol: ep.protocol || 'openai',
             defaultModel: ep.model || '',
         })
-
-        // ===== 诊断：await 所有异步方法 =====
-        try {
-            const cfg = await newClient.getEffectiveConfig(ep.name)
-            console.log(`[DIAG][BUILD] getEffectiveConfig("${ep.name}"):`, cfg)
-        } catch (e) {
-            console.error(`[DIAG][BUILD] getEffectiveConfig threw:`, e)
-        }
-
-        try {
-            const access = await newClient.getProviderAccess(ep.name)
-            console.log(`[DIAG][BUILD] getProviderAccess("${ep.name}"):`, access)
-        } catch (e) {
-            console.error(`[DIAG][BUILD] getProviderAccess threw:`, e)
-        }
-
-        // 同步调用 getRequiredEffectiveConfig，看它是否抛错
-        try {
-            const reqCfg = newClient.getRequiredEffectiveConfig(ep.name)
-            console.log(`[DIAG][BUILD] getRequiredEffectiveConfig("${ep.name}"):`, reqCfg)
-        } catch (e) {
-            console.error(`[DIAG][BUILD] getRequiredEffectiveConfig threw:`, e)
-        }
-        // ===== 诊断结束 =====
     }
 
     clientRef.value = newClient
-    console.log('[DIAG][BUILD] clientRef assigned. endpoints:', customEndpoints.value.map(e => e.name))
 }
 
 onMounted(async () => {
@@ -577,7 +552,7 @@ function selectTheme(v) { emit('update:themeMode', v) }
                                         <div v-for="ep in customEndpoints" :key="ep.name" class="custom-endpoint-item">
                                             <div class="custom-endpoint-info">
                                                 <span class="custom-endpoint-name">{{ ep.displayName || ep.name
-                                                    }}</span>
+                                                }}</span>
                                                 <span class="custom-endpoint-url">{{ ep.baseURL }}</span>
                                                 <span class="custom-endpoint-model">{{ ep.model }}</span>
                                             </div>
@@ -639,7 +614,7 @@ function selectTheme(v) { emit('update:themeMode', v) }
                                             <span class="field-label">模型 <span class="req">*</span>
                                                 <span v-if="modelsLoading" class="field-hint-inline">（拉取中…）</span>
                                                 <span v-else-if="modelsError" class="field-hint-inline">（{{ modelsError
-                                                    }}）</span>
+                                                }}）</span>
                                             </span>
                                             <div v-if="availableModels.length" class="field-row">
                                                 <select v-model="form.model" class="field-select">
@@ -680,7 +655,7 @@ function selectTheme(v) { emit('update:themeMode', v) }
                                             <span class="field-label">模型 <span class="req">*</span>
                                                 <span v-if="modelsLoading" class="field-hint-inline">（拉取中…）</span>
                                                 <span v-else-if="modelsError" class="field-hint-inline">（{{ modelsError
-                                                    }}）</span>
+                                                }}）</span>
                                             </span>
                                             <div class="field-row">
                                                 <select v-if="availableModels.length" v-model="form.model"

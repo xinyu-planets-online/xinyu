@@ -12,6 +12,7 @@ import ConversationSidebar from './components/ConversationSidebar.vue'
 import SettingsDrawer from './components/SettingsDrawer.vue'
 import ConversationTree from './components/ConversationTree.vue'
 import EditMessageDialog from './components/EditMessageDialog.vue'
+import VoiceInputButton from './components/VoiceInputButton.vue'
 
 import { useTheme } from './composables/useTheme'
 import { useNotice } from './composables/useNotice'
@@ -36,6 +37,9 @@ const showTree = ref(false)
 const currentProvider = ref('')
 const currentModel = ref('')
 const settingsRef = ref(null)
+
+// 语音识别基底文本：跟随输入框实时同步
+const voiceBaseText = ref('')
 
 const models = ref([])
 
@@ -168,29 +172,6 @@ async function onSend({ text, files }) {
   const providerName = currentProvider.value
   const modelName = currentModel.value
 
-  // ===== 诊断：await 异步方法 + 同步方法 =====
-  try {
-    const cfg = await client.getEffectiveConfig(providerName)
-    console.log(`[DIAG][SEND] getEffectiveConfig("${providerName}"):`, cfg)
-  } catch (e) {
-    console.error(`[DIAG][SEND] getEffectiveConfig threw:`, e)
-  }
-
-  try {
-    const access = await client.getProviderAccess(providerName)
-    console.log(`[DIAG][SEND] getProviderAccess("${providerName}"):`, access)
-  } catch (e) {
-    console.error(`[DIAG][SEND] getProviderAccess threw:`, e)
-  }
-
-  try {
-    const reqCfg = client.getRequiredEffectiveConfig(providerName)
-    console.log(`[DIAG][SEND] getRequiredEffectiveConfig("${providerName}"):`, reqCfg)
-  } catch (e) {
-    console.error(`[DIAG][SEND] getRequiredEffectiveConfig threw:`, e)
-  }
-  // ===== 诊断结束 =====
-
   if (!activeConversationId.value) await createConversation()
   const current = activeConversation.value
   if (!current) return
@@ -213,6 +194,36 @@ async function onSend({ text, files }) {
     conversation: current,
     userSystemPrompt: userSystemPrompt.value,
   })
+}
+
+// ===== 语音回填：只写入输入框，不发送 =====
+function setChatInputText(text) {
+  const ta = chatWrapper.value?.querySelector('.acu-input-textarea')
+  if (!ta) return
+  ta.value = text
+  // 关键：派发 input 事件，让 ChatContainer 内部的受控状态同步
+  ta.dispatchEvent(new Event('input', { bubbles: true }))
+  ta.focus()
+  const len = ta.value.length
+  ta.setSelectionRange(len, len)
+}
+
+function onVoiceUpdate(text) {
+  setChatInputText(text || voiceBaseText.value)
+}
+
+function onVoiceFinish(text) {
+  const finalText = (text || '').trim()
+  if (!finalText) return
+  setChatInputText(finalText)
+  voiceBaseText.value = finalText
+}
+
+// 同步 textarea 当前值到 voiceBaseText（事件委托，不依赖 textarea 是否重建）
+function onInputDelegate(e) {
+  if (e.target?.classList?.contains('acu-input-textarea')) {
+    voiceBaseText.value = e.target.value
+  }
 }
 
 async function onSwitchNode(nodeId) { await switchToNode(nodeId) }
@@ -360,12 +371,16 @@ onMounted(async () => {
   initTheme()
   const restored = await loadConversations()
   if (!restored) await createConversation()
-  nextTick(() => { chatWrapper.value?.addEventListener('click', onWrapperClickCapture, true) })
+  nextTick(() => {
+    chatWrapper.value?.addEventListener('click', onWrapperClickCapture, true)
+    chatWrapper.value?.addEventListener('input', onInputDelegate)
+  })
 })
 
 onUnmounted(() => {
   document.removeEventListener('llm-hub-select', onLLMHubSelect)
   chatWrapper.value?.removeEventListener('click', onWrapperClickCapture, true)
+  chatWrapper.value?.removeEventListener('input', onInputDelegate)
   destroyTheme()
   cleanupNotice()
 })
@@ -390,12 +405,20 @@ onUnmounted(() => {
       <main class="chat-area">
         <div v-if="!currentProvider" class="hint"><span>先选一个模型，再开始对话</span><button class="hint-btn"
             @click="showSettings = true">去设置</button></div>
+
         <div ref="chatWrapper" class="chat-card">
           <ChatContainer :messages="messages" :preset-questions="presetQuestions" :theme="resolvedTheme"
             welcome-logo="/favicon.ico" assistantName="助手" welcome-title="你好，有什么可以帮你？"
             welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
             @select="onPresetSelect" />
+          <!-- 语音输入工具条 -->
+          <div class="chat-toolbar">
+            <VoiceInputButton :base-text="voiceBaseText" @update="onVoiceUpdate" @finish="onVoiceFinish" />
+            <span class="toolbar-hint">语音转文字，结果写入输入框</span>
+          </div>
         </div>
+
+
       </main>
     </div>
 
@@ -482,6 +505,21 @@ onUnmounted(() => {
   align-items: stretch;
   padding: 0.25rem clamp(0.625rem, 1.6vw, 1.375rem) clamp(0.75rem, 1.8vh, 1.375rem);
   gap: clamp(0.5rem, 1vh, 0.75rem);
+}
+
+/* 语音输入工具条 */
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.625rem;
+  margin-top: -0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.toolbar-hint {
+  font-size: 0.75rem;
+  color: var(--acu-text-muted);
 }
 
 .hint {
