@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { ChatContainer } from 'zen-ai-chat-ui'
 import 'zen-ai-chat-ui/style.css'
 import '@inteye/llm-hub-ui/element'
@@ -13,6 +13,7 @@ import SettingsDrawer from './components/SettingsDrawer.vue'
 import ConversationTree from './components/ConversationTree.vue'
 import EditMessageDialog from './components/EditMessageDialog.vue'
 import VoiceInputButton from './components/VoiceInputButton.vue'
+import ImageViewer from './components/ImageViewer.vue'
 
 import { useTheme } from './composables/useTheme'
 import { useNotice } from './composables/useNotice'
@@ -20,9 +21,11 @@ import { useConversations } from './composables/useConversations'
 import { useChatStream } from './composables/useChatStream'
 import { useUserSystemPrompt } from './composables/useSystemPrompts'
 import { summarizeFile, unwrapFile } from './composables/useAttachmentSummary'
+import { useLocalOcr } from './composables/useLocalOcr'
 
 const SELECTION_KEY = 'chat-selection'
 const MODELS_KEY = 'chat-models'
+const OCR_ENABLED_KEY = 'chat-ocr-enabled'
 
 const {
   themeLabel, themeMode, resolvedTheme, cycleTheme,
@@ -32,16 +35,32 @@ const {
 const { notice, showNotice, cleanup: cleanupNotice } = useNotice()
 const { userSystemPrompt } = useUserSystemPrompt()
 
+const { isRecognizing, ocrStatus, ocrProgress, recognize } = useLocalOcr()
+
+const ocrEnabled = ref(false)
+try {
+  ocrEnabled.value = localStorage.getItem(OCR_ENABLED_KEY) === '1'
+} catch { }
+
+watch(ocrEnabled, (v) => {
+  try {
+    if (v) localStorage.setItem(OCR_ENABLED_KEY, '1')
+    else localStorage.removeItem(OCR_ENABLED_KEY)
+  } catch { }
+})
+
 const showSettings = ref(false)
 const showTree = ref(false)
 const currentProvider = ref('')
 const currentModel = ref('')
 const settingsRef = ref(null)
 
-// 语音识别基底文本：跟随输入框实时同步
 const voiceBaseText = ref('')
-
 const models = ref([])
+
+// 图片灯箱
+const imageViewerVisible = ref(false)
+const imageViewerSrc = ref('')
 
 function genModelId() {
   return 'm-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
@@ -146,6 +165,23 @@ const {
   loadConversations,
 } = conv
 
+// 渲染用消息：有图片的节点在 content 末尾追加 Markdown 图片语法
+const displayMessages = computed(() =>
+  messages.value.map((m) => {
+    const imgs = m.images || []
+    if (!imgs.length) return m
+    const md = imgs
+      .filter((img) => img?.dataUrl)
+      .map((img) => `![图片](${img.dataUrl})`)
+      .join('\n\n')
+    if (!md) return m
+    return {
+      ...m,
+      content: m.content ? `${m.content}\n\n${md}` : md,
+    }
+  })
+)
+
 const presetQuestions = [
   { id: 'q1', label: '最近有点累，想聊聊', prompt: '我最近有点累，想找个人聊聊，你可以陪我说说话吗？' },
   { id: 'q2', label: '带我做一次呼吸放松', prompt: '带我做一次呼吸放松练习吧。' },
@@ -155,6 +191,79 @@ const presetQuestions = [
 
 function onPresetSelect(q) {
   onSend({ text: q.prompt, files: [] })
+}
+
+function isImageFile(f) {
+  const name = (f.name || '').toLowerCase()
+  const type = (f.type || '').toLowerCase()
+  return (
+    type.startsWith('image/') ||
+    /\.(png|jpe?g|webp|bmp|gif|tiff?)$/.test(name)
+  )
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+async function buildPayload({ files }) {
+  const hasFiles = Array.isArray(files) && files.length > 0
+  const summaries = []
+  const images = []
+
+  // 语义：
+  // OCR 关 -> 只发图片本体（多模态）
+  // OCR 开 -> 只发 OCR 文本，不发图片
+  const useOcr = hasFiles && ocrEnabled.value
+
+  if (hasFiles) {
+    for (const f of files) {
+      const raw = unwrapFile(f)
+      if (!raw) continue
+
+      if (isImageFile(raw)) {
+        if (useOcr) {
+          try {
+            const ocrText = await recognize(raw, 'chi_sim+eng')
+            summaries.push({
+              id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              name: raw.name || '图片',
+              size: raw.size || 0,
+              type: raw.type || 'image/*',
+              summary: ocrText
+                ? `[图片 OCR]\n${ocrText.slice(0, 2000)}`
+                : `[图片] ${raw.name || ''} (OCR 未识别出文字)`,
+              createdAt: Date.now(),
+            })
+          } catch (e) {
+            console.warn('[ocr] 识别失败', e)
+            try { summaries.push(await summarizeFile(raw)) } catch { }
+          }
+        } else {
+          try {
+            const dataUrl = await fileToDataUrl(raw)
+            images.push({
+              name: raw.name || 'image',
+              mime: raw.type || 'image/png',
+              dataUrl,
+            })
+          } catch (e) {
+            console.warn('[image] 读取失败', e)
+          }
+        }
+        continue
+      }
+
+      try { summaries.push(await summarizeFile(raw)) } catch { }
+    }
+  }
+
+  return { summaries, images, useOcr }
 }
 
 async function onSend({ text, files }) {
@@ -176,32 +285,41 @@ async function onSend({ text, files }) {
   const current = activeConversation.value
   if (!current) return
 
-  const summaries = []
-  if (hasFiles) {
-    for (const f of files) {
-      const raw = unwrapFile(f)
-      if (!raw) continue
-      try { summaries.push(await summarizeFile(raw)) } catch { }
-    }
-  }
+  const { summaries, images, useOcr } = await buildPayload({ files })
 
-  await chatStream.send({
+  const result = await chatStream.send({
     text: text || '',
     files: summaries,
+    images,
     provider: providerName,
     model: modelName,
     client,
     conversation: current,
     userSystemPrompt: userSystemPrompt.value,
   })
+
+  // 图片不支持：自动开 OCR、回滚、重试
+  if (result && !result.ok && result.isImageError && !useOcr) {
+    ocrEnabled.value = true
+    showNotice('当前模型不支持图片输入，已自动开启 OCR，正在改用图片文字重试...')
+
+    if (result.userNodeId) {
+      try {
+        await revertToNode(result.userNodeId)
+      } catch (e) {
+        console.warn('[retry] 回滚失败', e)
+      }
+    }
+
+    // 递归重试：此时 ocrEnabled 已为 true，会走 OCR 路径，不再发图片
+    await onSend({ text, files })
+  }
 }
 
-// ===== 语音回填：只写入输入框，不发送 =====
 function setChatInputText(text) {
   const ta = chatWrapper.value?.querySelector('.acu-input-textarea')
   if (!ta) return
   ta.value = text
-  // 关键：派发 input 事件，让 ChatContainer 内部的受控状态同步
   ta.dispatchEvent(new Event('input', { bubbles: true }))
   ta.focus()
   const len = ta.value.length
@@ -219,7 +337,6 @@ function onVoiceFinish(text) {
   voiceBaseText.value = finalText
 }
 
-// 同步 textarea 当前值到 voiceBaseText（事件委托，不依赖 textarea 是否重建）
 function onInputDelegate(e) {
   if (e.target?.classList?.contains('acu-input-textarea')) {
     voiceBaseText.value = e.target.value
@@ -259,7 +376,7 @@ async function onRegenerate(nodeId) {
     showSettings.value = true
     return
   }
-  await chatStream.regenerate({
+  const result = await chatStream.regenerate({
     assistantNodeId: nodeId,
     provider: currentProvider.value,
     model: currentModel.value,
@@ -267,6 +384,12 @@ async function onRegenerate(nodeId) {
     conversation: current,
     userSystemPrompt: userSystemPrompt.value,
   })
+
+  // 重新生成也可能命中图片错误
+  if (result && !result.ok && result.isImageError && !ocrEnabled.value) {
+    ocrEnabled.value = true
+    showNotice('当前模型不支持图片输入，已自动开启 OCR，请再点一次「重新生成」')
+  }
 }
 
 const editDialogVisible = ref(false)
@@ -338,6 +461,19 @@ async function attachActionBars(retry = 0) {
 watch(() => messages.value.map(m => m.id).join('|'), () => attachActionBars(), { immediate: true })
 
 function onWrapperClickCapture(e) {
+  // 优先处理图片点击：打开原图灯箱
+  const img = e.target.closest('img')
+  if (img && chatWrapper.value?.contains(img)) {
+    const src = img.getAttribute('src') || ''
+    if (src.startsWith('data:image/')) {
+      e.stopPropagation()
+      e.preventDefault()
+      imageViewerSrc.value = src
+      imageViewerVisible.value = true
+      return
+    }
+  }
+
   const actionBtn = e.target.closest('.msg-action-btn')
   if (actionBtn) {
     e.stopPropagation(); e.preventDefault()
@@ -407,18 +543,36 @@ onUnmounted(() => {
             @click="showSettings = true">去设置</button></div>
 
         <div ref="chatWrapper" class="chat-card">
-          <ChatContainer :messages="messages" :preset-questions="presetQuestions" :theme="resolvedTheme"
+          <ChatContainer :messages="displayMessages" :preset-questions="presetQuestions" :theme="resolvedTheme"
             welcome-logo="/favicon.ico" assistantName="助手" welcome-title="你好，有什么可以帮你？"
             welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
             @select="onPresetSelect" />
-          <!-- 语音输入工具条 -->
+
+          <!-- 聊天工具条：语音输入 + OCR 开关 -->
           <div class="chat-toolbar">
             <VoiceInputButton :base-text="voiceBaseText" @update="onVoiceUpdate" @finish="onVoiceFinish" />
-            <span class="toolbar-hint">语音转文字，结果写入输入框</span>
+
+            <button class="ocr-toggle" :class="{ active: ocrEnabled }" :title="ocrEnabled
+              ? '只发图片中的文字，不发图片本体（点击关闭，改为直接发图片）'
+              : '图片直接发给模型（点击开启 OCR，改为只发图片中的文字）'" @click="ocrEnabled = !ocrEnabled">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="2.5" y="3.5" width="11" height="9" rx="1.5" stroke="currentColor" stroke-width="1.4" />
+                <path d="M5 7h2M5 9h4M9 6l1.5 1.5L9 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
+                  stroke-linejoin="round" />
+              </svg>
+              <span>{{ ocrEnabled ? 'OCR 开' : 'OCR 关' }}</span>
+            </button>
+          </div>
+
+          <!-- 本地 OCR 进度 -->
+          <div v-if="isRecognizing" class="ocr-progress">
+            <span class="ocr-progress-label">{{ ocrStatus }}</span>
+            <div class="ocr-progress-track">
+              <div class="ocr-progress-fill" :style="{ width: ocrProgress + '%' }" />
+            </div>
+            <span class="ocr-progress-value">{{ ocrProgress }}%</span>
           </div>
         </div>
-
-
       </main>
     </div>
 
@@ -439,6 +593,9 @@ onUnmounted(() => {
 
     <EditMessageDialog :visible="editDialogVisible" :content="editDialogContent" @close="closeEditDialog"
       @submit="submitEditDialog" />
+
+    <ImageViewer :visible="imageViewerVisible" :src="imageViewerSrc" alt="图片预览"
+      @close="imageViewerVisible = false; imageViewerSrc = ''" />
 
     <SettingsDrawer ref="settingsRef" :show-settings="showSettings" :current-provider="currentProvider"
       :current-model="currentModel" :models="models" :theme-mode="themeMode" :user-system-prompt="userSystemPrompt"
@@ -507,19 +664,86 @@ onUnmounted(() => {
   gap: clamp(0.5rem, 1vh, 0.75rem);
 }
 
-/* 语音输入工具条 */
 .chat-toolbar {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.625rem;
+  gap: 0.5rem;
   margin-top: -0.5rem;
   margin-bottom: 0.5rem;
 }
 
-.toolbar-hint {
+.ocr-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 2.25rem;
+  padding: 0 0.75rem;
   font-size: 0.75rem;
   color: var(--acu-text-muted);
+  background: var(--acu-bg);
+  border: 1px solid var(--acu-border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.ocr-toggle svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.ocr-toggle:hover {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+}
+
+.ocr-toggle.active {
+  color: var(--acu-primary-contrast);
+  background: var(--acu-primary);
+  border-color: var(--acu-primary);
+}
+
+.ocr-toggle:focus-visible {
+  outline: 2px solid var(--acu-primary);
+  outline-offset: 2px;
+}
+
+.ocr-progress {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.75rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--acu-text-muted);
+}
+
+.ocr-progress-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ocr-progress-track {
+  flex: 1 1 auto;
+  height: 0.25rem;
+  background: var(--acu-border);
+  border-radius: 999rem;
+  overflow: hidden;
+}
+
+.ocr-progress-fill {
+  height: 100%;
+  background: var(--acu-primary);
+  transition: width 0.2s ease;
+}
+
+.ocr-progress-value {
+  flex: 0 0 auto;
+  min-width: 2.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .hint {
@@ -567,6 +791,24 @@ onUnmounted(() => {
 
 :deep(.acu-welcome-logo) {
   display: none;
+}
+
+/* 缩略图：固定尺寸 + object-fit 裁剪，点击放大 */
+:deep(.acu-md img) {
+  display: block;
+  width: 12rem;
+  height: 9rem;
+  max-width: 100%;
+  object-fit: cover;
+  object-position: center;
+  border-radius: 0.5rem;
+  margin: 0.375rem 0;
+  cursor: zoom-in;
+  transition: opacity 0.15s ease;
+}
+
+:deep(.acu-md img:hover) {
+  opacity: 0.9;
 }
 
 :deep(.acu-bubble-main) {
@@ -688,6 +930,15 @@ onUnmounted(() => {
   }
 
   :deep(.msg-action-bar) {
+    transition: none;
+  }
+
+  :deep(.acu-md img) {
+    transition: none;
+  }
+
+  .ocr-progress-fill,
+  .ocr-toggle {
     transition: none;
   }
 }
