@@ -502,6 +502,16 @@ function onWrapperClickCapture(e) {
   }
 }
 
+// 云备份：拉取并导入成功后，重新读表刷新侧栏与当前会话
+function handleCloudImported() {
+  loadConversations()
+}
+
+// 云备份：清空浏览器数据后，直接刷新页面
+function handleCloudCleared() {
+  location.reload()
+}
+
 onMounted(async () => {
   document.addEventListener('llm-hub-select', onLLMHubSelect)
   initTheme()
@@ -601,7 +611,7 @@ onUnmounted(() => {
       :current-model="currentModel" :models="models" :theme-mode="themeMode" :user-system-prompt="userSystemPrompt"
       @close="showSettings = false" @update:theme-mode="themeMode = $event"
       @update:user-system-prompt="userSystemPrompt = $event" @switch-model="switchModel" @remove-model="removeModel"
-      @add-model="onAddModel" />
+      @add-model="onAddModel" @data-imported="handleCloudImported" @data-cleared="handleCloudCleared" />
   </div>
 </template>
 

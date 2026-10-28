@@ -3,6 +3,9 @@ import { ref, computed, watch, shallowRef, onMounted } from 'vue'
 import { createClient } from '@inteye/llm-hub'
 import * as allProviders from '@inteye/llm-hub/providers'
 import { createCustomProvider } from '@inteye/llm-hub/providers'
+import { encryptPayload, decryptPayload } from '@/utils/securePayload'
+import LoginModal from '@/components/LoginModal.vue'
+import { exportAll, importAll, listConversations } from '@/db/chatRepository'
 
 const props = defineProps({
     showSettings: { type: Boolean, default: false },
@@ -16,6 +19,7 @@ const props = defineProps({
 const emit = defineEmits([
     'close', 'update:themeMode', 'update:userSystemPrompt',
     'switch-model', 'remove-model', 'add-model',
+    'data-imported', 'data-cleared',
 ])
 
 const CANDIDATE_NAMES = [
@@ -151,6 +155,7 @@ const activeTab = ref('model')
 const tabs = [
     { key: 'model', label: '模型' },
     { key: 'prompt', label: '提示词' },
+    { key: 'cloud', label: '云备份' },
     { key: 'appearance', label: '外观' },
 ]
 function switchTab(key) { activeTab.value = key; view.value = 'main' }
@@ -467,6 +472,429 @@ const themeOptions = [
     { value: 'dark', label: '深色', desc: '始终使用深色主题' },
 ]
 function selectTheme(v) { emit('update:themeMode', v) }
+
+// ============ 云备份（新增，独立于 useConversations 的导出导入流程） ============
+// 约束：
+// 1. 切到 cloud tab 时按需检测登录；未登录强引导登录；任何 401 都弹登录框
+// 2. PUT / DELETE 前先拉 /v1/chat-data/info 并展示为确认提示；PUT 面板允许填写 custom_summary
+// 3. 加密密码独立于账户密码，不写入任何持久化存储；上传 / 拉取成功后清空，关闭抽屉或切走 tab 也清空
+// 4. 删除服务器备份 / 清空浏览器数据：两条路径互斥，各自独立二次确认
+
+const CLOUD_INFO_URL = '/v1/chat-data/info'
+const CLOUD_DATA_URL = '/v1/chat-data'
+const ACTIVE_KEY = 'chat-active-id'
+
+const cloudStatus = ref('idle')         // idle | checking | logged-in | logged-out | error
+const cloudInfo = ref(null)             // /v1/chat-data/info 响应体
+const cloudLocalStats = ref(null)       // 上传面板打开时统计的本地数据量
+const cloudPassword = ref('')
+const showCloudPassword = ref(false)
+const cloudSummaryDraft = ref('')
+const cloudBusy = ref(false)
+const cloudMsg = ref('')
+const cloudMsgType = ref('')            // success | error
+const cloudAction = ref(null)           // null | 'upload' | 'delete' | 'wipe-local'
+const loginModalOpen = ref(false)
+
+function fmtTime(iso) {
+    if (!iso) return '未知'
+    try { return new Date(iso).toLocaleString() } catch { return iso }
+}
+
+function resetCloudMsg() { cloudMsg.value = ''; cloudMsgType.value = '' }
+
+// 切到 cloud tab 按需检测；切走清空一次性状态
+watch(activeTab, (v) => {
+    if (v === 'cloud') {
+        if (cloudStatus.value === 'idle') checkCloudAuth()
+    } else {
+        cloudPassword.value = ''
+        showCloudPassword.value = false
+        cloudSummaryDraft.value = ''
+        cloudAction.value = null
+        cloudLocalStats.value = null
+    }
+})
+
+// 关闭抽屉清空密码与一次性状态
+watch(() => props.showSettings, (v) => {
+    if (!v) {
+        cloudPassword.value = ''
+        showCloudPassword.value = false
+        cloudSummaryDraft.value = ''
+        cloudAction.value = null
+        cloudLocalStats.value = null
+        resetCloudMsg()
+    } else if (activeTab.value === 'cloud' && cloudStatus.value === 'idle') {
+        checkCloudAuth()
+    }
+})
+
+async function fetchCloudInfo() {
+    try {
+        const r = await fetch(CLOUD_INFO_URL, {
+            credentials: 'include',
+            headers: { Accept: 'application/json' },
+        })
+
+        if (r.status === 401) return { ok: false, status: 401, reason: 'unauthorized' }
+        if (!r.ok) return { ok: false, status: r.status, reason: 'http' }
+
+        // 被重定向到登录页 / 其他路径：最终 URL 与请求路径不一致
+        try {
+            const expected = new URL(CLOUD_INFO_URL, location.origin)
+            const finalUrl = new URL(r.url, location.origin)
+            if (finalUrl.pathname !== expected.pathname) {
+                return { ok: false, status: 401, reason: 'redirected' }
+            }
+        } catch {
+            return { ok: false, status: 401, reason: 'redirected' }
+        }
+
+        const ct = (r.headers.get('Content-Type') || '').toLowerCase()
+        if (!ct.includes('application/json')) {
+            return { ok: false, status: 401, reason: 'not-json' }
+        }
+
+        let info
+        try { info = await r.json() } catch { return { ok: false, status: 401, reason: 'bad-json' } }
+
+        if (!info || typeof info !== 'object' || typeof info.exists !== 'boolean') {
+            return { ok: false, status: 401, reason: 'bad-shape' }
+        }
+
+        return { ok: true, status: r.status, info }
+    } catch (e) {
+        return { ok: false, status: 0, reason: 'network', message: e?.message || '网络错误' }
+    }
+}
+
+async function checkCloudAuth() {
+    cloudStatus.value = 'checking'
+    resetCloudMsg()
+    const res = await fetchCloudInfo()
+    if (res.ok) {
+        cloudStatus.value = 'logged-in'
+        cloudInfo.value = res.info
+        return
+    }
+    cloudInfo.value = null
+    if (res.reason === 'network' || res.reason === 'http') {
+        cloudStatus.value = 'error'
+        cloudMsg.value = res.message || `检测失败：HTTP ${res.status}`
+        cloudMsgType.value = 'error'
+        return
+    }
+    // unauthorized / redirected / not-json / bad-json / bad-shape 一律视为未登录
+    cloudStatus.value = 'logged-out'
+}
+
+function openLogin() { loginModalOpen.value = true }
+
+function onLoginChanged(state) {
+    if (state === 'logged-in') {
+        cloudStatus.value = 'logged-in'
+        cloudMsg.value = '登录成功'
+        cloudMsgType.value = 'success'
+        fetchCloudInfo().then(res => { if (res.ok) cloudInfo.value = res.info })
+    } else {
+        cloudInfo.value = null
+        checkCloudAuth()
+    }
+}
+
+function handle401() {
+    cloudStatus.value = 'logged-out'
+    cloudInfo.value = null
+    cloudMsg.value = '登录已过期，请重新登录'
+    cloudMsgType.value = 'error'
+    loginModalOpen.value = true
+}
+
+function cancelAction() {
+    cloudAction.value = null
+    cloudLocalStats.value = null
+}
+
+// 计算本地可上传的非空对话数（与陈述 2.2 空会话判定一致）
+async function computeLocalStats() {
+    cloudLocalStats.value = null
+    try {
+        const all = await exportAll()
+        const msgsByConv = new Map()
+        for (const m of all.messages) {
+            if (!msgsByConv.has(m.conversationId)) msgsByConv.set(m.conversationId, [])
+            msgsByConv.get(m.conversationId).push(m)
+        }
+        let count = 0, messageCount = 0
+        for (const c of all.conversations) {
+            const arr = msgsByConv.get(c.id) || []
+            if (!arr.length) continue
+            if (!arr.some(m => m.content && String(m.content).trim())) continue
+            count++
+            messageCount += arr.length
+        }
+        cloudLocalStats.value = { count, messageCount }
+    } catch {
+        cloudLocalStats.value = null
+    }
+}
+
+// 构建上传 payload（复用陈述 2.2 空会话过滤，全程只读三表）
+async function buildCloudPayload() {
+    const all = await exportAll()
+    const msgsByConv = new Map()
+    for (const m of all.messages) {
+        if (!msgsByConv.has(m.conversationId)) msgsByConv.set(m.conversationId, [])
+        msgsByConv.get(m.conversationId).push(m)
+    }
+    const nonEmpty = all.conversations.filter(c => {
+        const arr = msgsByConv.get(c.id) || []
+        if (!arr.length) return false
+        return arr.some(m => m.content && String(m.content).trim())
+    })
+    const nonEmptyIds = new Set(nonEmpty.map(c => c.id))
+    return {
+        version: 3,
+        exportedAt: new Date().toISOString(),
+        activeConversationId: '',
+        conversations: nonEmpty,
+        messages: all.messages.filter(m => nonEmptyIds.has(m.conversationId)),
+        attachments: all.attachments.filter(a => nonEmptyIds.has(a.conversationId)),
+    }
+}
+
+// 导入 payload（与 useConversations.handleImport 的去重规则一致：仅按 conversation.id）
+async function importCloudPayload(data) {
+    if (!data || !Array.isArray(data.conversations)) throw new Error('数据格式不正确')
+    const existing = new Set((await listConversations()).map(c => c.id))
+    const convs = data.conversations.filter(c => c?.id && !existing.has(c.id))
+    const convIds = new Set(convs.map(c => c.id))
+    const msgs = (data.messages || []).filter(m => m?.id && convIds.has(m.conversationId))
+    const atts = (data.attachments || []).filter(a => a?.id && convIds.has(a.conversationId))
+    if (!convs.length) return { added: 0, skipped: data.conversations.length }
+    await importAll({ conversations: convs, messages: msgs, attachments: atts })
+    return { added: convs.length, skipped: data.conversations.length - convs.length }
+}
+
+// -------- 上传：先拉 info 展示为确认提示 --------
+async function startUpload() {
+    resetCloudMsg()
+    if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
+    if (!cloudPassword.value) { cloudMsg.value = '请先输入加密密码'; cloudMsgType.value = 'error'; return }
+
+    cloudBusy.value = true
+    try {
+        const [infoRes] = await Promise.all([fetchCloudInfo(), computeLocalStats()])
+        if (!infoRes.ok) {
+            if (infoRes.reason === 'network' || infoRes.reason === 'http') {
+                cloudMsg.value = infoRes.message || `获取云端状态失败：HTTP ${infoRes.status}`
+                cloudMsgType.value = 'error'
+                return
+            }
+            handle401()
+            return
+        }
+        cloudInfo.value = infoRes.info
+        cloudSummaryDraft.value = infoRes.info?.custom_summary || ''
+        cloudAction.value = 'upload'
+    } finally {
+        cloudBusy.value = false
+    }
+}
+
+async function confirmUpload() {
+    resetCloudMsg()
+    if (!cloudPassword.value) { cloudMsg.value = '请先输入加密密码'; cloudMsgType.value = 'error'; return }
+    cloudBusy.value = true
+    try {
+        const payload = await buildCloudPayload()
+        if (!payload.conversations.length) {
+            cloudMsg.value = '没有可导出的对话（空对话已自动忽略）'
+            cloudMsgType.value = 'error'
+            cancelAction()
+            return
+        }
+        const cipher = encryptPayload(payload, cloudPassword.value)
+        const r = await fetch(CLOUD_DATA_URL, {
+            method: 'PUT',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                payload_version: 'v1',
+                cipher_payload: cipher,
+                custom_summary: (cloudSummaryDraft.value || '').slice(0, 300) || null,
+            }),
+        })
+        if (r.status === 401) { handle401(); return }
+        if (r.status === 403) { cloudMsg.value = '同源校验失败'; cloudMsgType.value = 'error'; return }
+        if (r.status === 400) {
+            const d = await r.json().catch(() => null)
+            cloudMsg.value = d?.message || '请求参数不合法'
+            cloudMsgType.value = 'error'
+            return
+        }
+        if (!r.ok) { cloudMsg.value = `上传失败：HTTP ${r.status}`; cloudMsgType.value = 'error'; return }
+
+        // 200 也要校验是否被重定向到登录页
+        const ct = (r.headers.get('Content-Type') || '').toLowerCase()
+        if (!ct.includes('application/json')) { handle401(); return }
+        const resp = await r.json().catch(() => null)
+        if (!resp || typeof resp !== 'object') { handle401(); return }
+
+        cloudMsg.value = `已上传：${payload.conversations.length} 个对话` +
+            (resp?.updated_at ? `，${fmtTime(resp.updated_at)}` : '')
+    } finally {
+        cloudBusy.value = false
+    }
+}
+
+// -------- 拉取并导入 --------
+async function pullFromCloud() {
+    resetCloudMsg()
+    if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
+    if (!cloudPassword.value) { cloudMsg.value = '请先输入加密密码'; cloudMsgType.value = 'error'; return }
+
+    cloudBusy.value = true
+    try {
+        const r = await fetch(CLOUD_DATA_URL, {
+            credentials: 'include',
+            headers: { Accept: 'application/json' },
+        })
+        if (r.status === 401) { handle401(); return }
+        if (!r.ok) { cloudMsg.value = `拉取失败：HTTP ${r.status}`; cloudMsgType.value = 'error'; return }
+
+        try {
+            const expected = new URL(CLOUD_DATA_URL, location.origin)
+            const finalUrl = new URL(r.url, location.origin)
+            if (finalUrl.pathname !== expected.pathname) { handle401(); return }
+        } catch { handle401(); return }
+
+        const ct = (r.headers.get('Content-Type') || '').toLowerCase()
+        if (!ct.includes('application/json')) { handle401(); return }
+
+        const data = await r.json().catch(() => null)
+        if (!data || typeof data !== 'object' || typeof data.exists !== 'boolean') {
+            handle401()
+            return
+        }
+        if (!data.exists || !data.cipher_payload) {
+            cloudMsg.value = '云端无备份'
+            cloudMsgType.value = 'error'
+            return
+        }
+        let payload
+        try {
+            payload = decryptPayload(data.cipher_payload, cloudPassword.value)
+        } catch (e) {
+            cloudMsg.value = e?.message || '解密失败'
+            cloudMsgType.value = 'error'
+            return
+        }
+        const result = await importCloudPayload(payload)
+        cloudMsg.value = result.added > 0
+            ? `已导入：新增 ${result.added} 个，跳过 ${result.skipped} 个`
+            : `无新对话（${result.skipped} 个已存在或无效）`
+        cloudMsgType.value = 'success'
+        if (result.added > 0) emit('data-imported')
+        cloudPassword.value = ''
+        showCloudPassword.value = false
+    } finally {
+        cloudBusy.value = false
+    }
+}
+
+// -------- 删除服务器备份：先拉 info 展示为确认提示 --------
+async function startDeleteServer() {
+    resetCloudMsg()
+    if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
+
+    cloudBusy.value = true
+    try {
+        const infoRes = await fetchCloudInfo()
+        if (!infoRes.ok) {
+            if (infoRes.reason === 'network' || infoRes.reason === 'http') {
+                cloudMsg.value = infoRes.message || `获取云端状态失败：HTTP ${infoRes.status}`
+                cloudMsgType.value = 'error'
+                return
+            }
+            handle401()
+            return
+        }
+        cloudInfo.value = infoRes.info
+        if (!infoRes.info?.exists) {
+            cloudMsg.value = '云端无备份可删除'
+            cloudMsgType.value = 'error'
+            return
+        }
+        cloudAction.value = 'delete'
+    } finally {
+        cloudBusy.value = false
+    }
+}
+
+async function confirmDeleteServer() {
+    resetCloudMsg()
+    cloudBusy.value = true
+    try {
+        const r = await fetch(CLOUD_DATA_URL, { method: 'DELETE', credentials: 'include' })
+        if (r.status === 204) {
+            cloudMsg.value = '服务器备份已删除'
+            cloudMsgType.value = 'success'
+            cancelAction()
+            fetchCloudInfo().then(res => { if (res.ok) cloudInfo.value = res.info })
+            return
+        }
+        if (r.status === 401) { handle401(); return }
+        if (r.status === 403) { cloudMsg.value = '同源校验失败'; cloudMsgType.value = 'error'; return }
+        if (r.ok) {
+            // 约定成功是 204；200/其他 2xx 大概率是被重定向到登录页
+            handle401()
+            return
+        }
+        cloudMsg.value = `删除失败：HTTP ${r.status}`
+        cloudMsgType.value = 'error'
+    } finally {
+        cloudBusy.value = false
+    }
+}
+
+// -------- 清空浏览器数据（本地操作，无需密码、无需 info） --------
+function startWipeLocal() {
+    resetCloudMsg()
+    cloudAction.value = 'wipe-local'
+}
+
+async function confirmWipeLocal() {
+    resetCloudMsg()
+    cloudBusy.value = true
+    try {
+        await new Promise((resolve, reject) => {
+            const req = indexedDB.open('ChatAppDB')
+            req.onsuccess = () => {
+                const db = req.result
+                const tx = db.transaction(['conversations', 'messages', 'attachments'], 'readwrite')
+                tx.objectStore('conversations').clear()
+                tx.objectStore('messages').clear()
+                tx.objectStore('attachments').clear()
+                tx.oncomplete = () => { db.close(); resolve() }
+                tx.onerror = () => reject(tx.error || new Error('事务失败'))
+                tx.onabort = () => reject(new Error('事务中止'))
+            }
+            req.onerror = () => reject(req.error || new Error('无法打开 IndexedDB'))
+        })
+        try { localStorage.removeItem(ACTIVE_KEY) } catch { }
+        cancelAction()
+        cloudMsg.value = '浏览器数据已清空，建议刷新页面'
+        cloudMsgType.value = 'success'
+        emit('data-cleared')
+    } catch (e) {
+        cloudMsg.value = '清空失败：' + (e?.message || '未知错误')
+        cloudMsgType.value = 'error'
+    } finally {
+        cloudBusy.value = false
+    }
+}
 </script>
 
 <template>
@@ -739,6 +1167,209 @@ function selectTheme(v) { emit('update:themeMode', v) }
                                 </div>
                             </section>
 
+                            <section v-if="activeTab === 'cloud'" class="tab-pane">
+                                <header class="pane-head">
+                                    <h3 class="pane-title">云备份</h3>
+                                    <p class="pane-desc">
+                                        上传复用现有导出流程（空会话自动剔除）→ gzip 压缩 → AES 加密 → 放入
+                                        <code>cipher_payload</code>。拉取后按现有导入规则（conversation.id 去重）写回本地。
+                                    </p>
+                                </header>
+
+                                <div class="cloud-auth">
+                                    <template v-if="cloudStatus === 'checking'">
+                                        <span class="cloud-dot"></span>检测登录状态…
+                                    </template>
+                                    <template v-else-if="cloudStatus === 'logged-in'">
+                                        <span class="cloud-dot ok"></span>已登录
+                                        <button type="button" class="cloud-link" @click="openLogin">账户</button>
+                                    </template>
+                                    <template v-else-if="cloudStatus === 'logged-out'">
+                                        <span class="cloud-dot warn"></span>未登录
+                                    </template>
+                                    <template v-else>
+                                        <span class="cloud-dot err"></span>状态未知
+                                        <button type="button" class="cloud-link" @click="checkCloudAuth">重试</button>
+                                    </template>
+                                </div>
+
+                                <div v-if="cloudStatus === 'logged-out'" class="cloud-login-guide">
+                                    <p class="cloud-login-title">云备份需要登录后使用</p>
+                                    <p class="cloud-login-desc">
+                                        登录后可以上传、拉取、删除服务器上的加密备份。加密密码与账户密码相互独立，登录后在上传面板里单独输入。
+                                    </p>
+                                    <button type="button" class="btn-primary" @click="openLogin">立即登录</button>
+                                </div>
+
+                                <div v-else-if="cloudStatus === 'error'" class="cloud-login-guide">
+                                    <p class="cloud-login-title">无法获取云端状态</p>
+                                    <p class="cloud-login-desc">请检查网络或稍后重试。</p>
+                                    <button type="button" class="btn-ghost" @click="checkCloudAuth">重试</button>
+                                </div>
+
+                                <template v-else-if="cloudStatus === 'logged-in'">
+                                    <div class="cloud-info-summary">
+                                        <template v-if="cloudInfo?.exists">
+                                            <span class="cloud-badge ok">云端已有备份</span>
+                                            <span>上次上传：{{ fmtTime(cloudInfo.updated_at) }}</span>
+                                            <span v-if="cloudInfo.custom_summary">备注：{{ cloudInfo.custom_summary
+                                            }}</span>
+                                            <span v-if="cloudInfo.payload_version">版本：{{
+                                                cloudInfo.payload_version }}</span>
+                                        </template>
+                                        <template v-else-if="cloudInfo">
+                                            <span class="cloud-badge empty">云端暂无备份</span>
+                                        </template>
+                                        <template v-else>
+                                            <span class="cloud-badge empty">尚未获取云端状态</span>
+                                        </template>
+                                        <button type="button" class="cloud-link" :disabled="cloudBusy"
+                                            @click="checkCloudAuth">刷新</button>
+                                    </div>
+
+                                    <label class="field">
+                                        <span class="field-label">
+                                            加密密码 <span class="req">*</span>
+                                            <span class="opt">（独立于账户密码；仅内存使用，不写入任何存储；上传 / 拉取成功或关闭抽屉后自动清除）</span>
+                                        </span>
+                                        <div class="field-row">
+                                            <input v-model="cloudPassword"
+                                                :type="showCloudPassword ? 'text' : 'password'" class="field-input"
+                                                placeholder="加解密时输入" autocomplete="off" spellcheck="false" />
+                                            <button type="button" class="field-toggle"
+                                                @click="showCloudPassword = !showCloudPassword">
+                                                {{ showCloudPassword ? '隐藏' : '显示' }}
+                                            </button>
+                                            <button type="button" class="field-toggle" :disabled="!cloudPassword"
+                                                @click="cloudPassword = ''">清空</button>
+                                        </div>
+                                    </label>
+
+                                    <div v-if="!cloudAction" class="cloud-actions">
+                                        <button type="button" class="btn-primary" :disabled="cloudBusy"
+                                            @click="startUpload">
+                                            {{ cloudBusy ? '处理中…' : '上传到云端' }}
+                                        </button>
+                                        <button type="button" class="btn-ghost" :disabled="cloudBusy"
+                                            @click="pullFromCloud">
+                                            拉取并导入
+                                        </button>
+                                    </div>
+
+                                    <div v-if="cloudAction === 'upload'" class="cloud-confirm">
+                                        <p class="cloud-confirm-title">确认上传</p>
+                                        <div class="cloud-info-block">
+                                            <template v-if="cloudInfo?.exists">
+                                                <p class="cloud-warn-line">⚠️ 云端已有备份，本次上传将覆盖</p>
+                                                <p>上次上传：{{ fmtTime(cloudInfo.updated_at) }}</p>
+                                                <p v-if="cloudInfo.custom_summary">上次备注：{{ cloudInfo.custom_summary
+                                                }}</p>
+                                                <p v-if="cloudInfo.payload_version">上次版本：{{
+                                                    cloudInfo.payload_version }}</p>
+                                            </template>
+                                            <template v-else>
+                                                <p>云端暂无备份，本次将新建。</p>
+                                            </template>
+                                            <p v-if="cloudLocalStats">
+                                                本地可上传：{{ cloudLocalStats.count }} 个对话 / {{
+                                                    cloudLocalStats.messageCount }} 条消息（空对话已忽略）
+                                            </p>
+                                        </div>
+                                        <label class="field">
+                                            <span class="field-label">备注 <span class="opt">（可选，≤300
+                                                    字）</span></span>
+                                            <input v-model="cloudSummaryDraft" class="field-input" maxlength="300"
+                                                placeholder="例如：2026-10 全量备份" autocomplete="off" spellcheck="false" />
+                                        </label>
+                                        <div class="cloud-confirm-actions">
+                                            <button type="button" class="btn-ghost" :disabled="cloudBusy"
+                                                @click="cancelAction">取消</button>
+                                            <button type="button" class="btn-primary" :disabled="cloudBusy"
+                                                @click="confirmUpload">
+                                                {{ cloudBusy ? '上传中…' : '确认上传' }}
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div v-if="cloudAction === 'delete'" class="cloud-confirm danger">
+                                        <p class="cloud-confirm-title">确认删除服务器备份</p>
+                                        <div class="cloud-info-block">
+                                            <template v-if="cloudInfo?.exists">
+                                                <p>将要删除的云端备份：</p>
+                                                <p>上次上传：{{ fmtTime(cloudInfo.updated_at) }}</p>
+                                                <p v-if="cloudInfo.custom_summary">备注：{{ cloudInfo.custom_summary }}
+                                                </p>
+                                                <p v-if="cloudInfo.payload_version">版本：{{
+                                                    cloudInfo.payload_version }}</p>
+                                            </template>
+                                            <p v-else>云端无备份可删除。</p>
+                                            <p class="danger-hint">物理删除，不可恢复；不影响浏览器本地对话。</p>
+                                        </div>
+                                        <div class="cloud-confirm-actions">
+                                            <button type="button" class="btn-ghost" :disabled="cloudBusy"
+                                                @click="cancelAction">取消</button>
+                                            <button type="button" class="btn-danger"
+                                                :disabled="cloudBusy || !cloudInfo?.exists"
+                                                @click="confirmDeleteServer">
+                                                {{ cloudBusy ? '删除中…' : '确认删除' }}
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div v-if="cloudAction === 'wipe-local'" class="cloud-confirm danger">
+                                        <p class="cloud-confirm-title">确认清空浏览器数据</p>
+                                        <div class="cloud-info-block">
+                                            <p>将清空本地 IndexedDB 中的全部对话、消息与附件摘要。</p>
+                                            <p class="danger-hint">
+                                                此操作不可恢复；<strong>不影响云端备份</strong>。若尚未上传备份，清空后数据将无法找回。
+                                            </p>
+                                        </div>
+                                        <div class="cloud-confirm-actions">
+                                            <button type="button" class="btn-ghost" :disabled="cloudBusy"
+                                                @click="cancelAction">取消</button>
+                                            <button type="button" class="btn-danger" :disabled="cloudBusy"
+                                                @click="confirmWipeLocal">
+                                                {{ cloudBusy ? '清空中…' : '确认清空' }}
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div v-if="!cloudAction" class="cloud-danger">
+                                        <h4 class="danger-title">危险操作</h4>
+                                        <div class="danger-row">
+                                            <div class="danger-info">
+                                                <p class="danger-name">删除服务器备份</p>
+                                                <p class="danger-desc">物理删除云端密文，不可恢复；不影响浏览器本地对话。</p>
+                                            </div>
+                                            <button type="button" class="btn-ghost danger" :disabled="cloudBusy"
+                                                @click="startDeleteServer">
+                                                删除
+                                            </button>
+                                        </div>
+                                        <div class="danger-row">
+                                            <div class="danger-info">
+                                                <p class="danger-name">清空浏览器数据</p>
+                                                <p class="danger-desc">清空本地 IndexedDB 中所有对话、消息与附件摘要，不可恢复；不影响云端备份。
+                                                </p>
+                                            </div>
+                                            <button type="button" class="btn-ghost danger" :disabled="cloudBusy"
+                                                @click="startWipeLocal">
+                                                清空
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+
+                                <p v-if="cloudMsg" class="cloud-msg" :class="cloudMsgType">{{ cloudMsg }}</p>
+
+                                <div class="note">
+                                    <p>加密密码与账户密码相互独立，请牢记，一经丢失无法找回</p>
+                                </div>
+
+                                <LoginModal :show="loginModalOpen" probe-url="/v1/chat-data/info"
+                                    @close="loginModalOpen = false" @changed="onLoginChanged" />
+                            </section>
+
                             <section v-if="activeTab === 'appearance'" class="tab-pane">
                                 <header class="pane-head">
                                     <h3 class="pane-title">主题</h3>
@@ -846,7 +1477,6 @@ function selectTheme(v) { emit('update:themeMode', v) }
     flex: 1;
 }
 
-/* 其余原有样式保持不变，为节省篇幅省略，请保留你文件中的全部原有样式 */
 .settings-mask {
     position: fixed;
     inset: 0;
@@ -1655,5 +2285,269 @@ function selectTheme(v) { emit('update:themeMode', v) }
     .settings-leave-active .settings-panel {
         transition: none;
     }
+}
+
+/* ============ 云备份（新增） ============ */
+.cloud-auth {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.625rem 0.875rem;
+    font-size: 0.8125rem;
+    color: var(--acu-text-secondary);
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+}
+
+.cloud-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--acu-border-strong);
+}
+
+.cloud-dot.ok {
+    background: var(--acu-success);
+}
+
+.cloud-dot.warn {
+    background: var(--acu-error);
+}
+
+.cloud-dot.err {
+    background: var(--acu-warning, var(--acu-error));
+}
+
+.cloud-link {
+    padding: 0;
+    margin-left: auto;
+    font-size: 0.75rem;
+    color: var(--acu-primary);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+}
+
+.cloud-link:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.cloud-link:hover:not(:disabled) {
+    text-decoration: underline;
+}
+
+.cloud-login-guide {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 1rem 1.125rem;
+    background: var(--acu-surface);
+    border: 1px dashed var(--acu-border-strong);
+    border-radius: 0.75rem;
+}
+
+.cloud-login-title {
+    margin: 0;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--acu-text);
+}
+
+.cloud-login-desc {
+    margin: 0;
+    font-size: 0.75rem;
+    line-height: 1.65;
+    color: var(--acu-text-muted);
+}
+
+.cloud-login-guide>.btn-primary,
+.cloud-login-guide>.btn-ghost {
+    align-self: flex-start;
+}
+
+.cloud-info-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.625rem 0.875rem;
+    font-size: 0.75rem;
+    color: var(--acu-text-secondary);
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+}
+
+.cloud-badge {
+    padding: 0.0625rem 0.4375rem;
+    border-radius: 999rem;
+    font-size: 0.6875rem;
+    font-weight: 500;
+}
+
+.cloud-badge.ok {
+    color: var(--acu-success);
+    background: var(--acu-success-soft, rgba(46, 160, 67, 0.12));
+}
+
+.cloud-badge.empty {
+    color: var(--acu-text-muted);
+    background: var(--acu-surface-2);
+}
+
+.cloud-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.cloud-confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0.875rem 1rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border-strong);
+    border-radius: 0.5rem;
+}
+
+.cloud-confirm.danger {
+    border-color: var(--acu-error);
+    background: var(--acu-error-soft);
+}
+
+.cloud-confirm-title {
+    margin: 0;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--acu-text);
+}
+
+.cloud-info-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.6;
+    color: var(--acu-text-secondary);
+    background: var(--acu-bg);
+    border-radius: 0.375rem;
+}
+
+.cloud-info-block p {
+    margin: 0;
+}
+
+.cloud-warn-line {
+    color: var(--acu-error);
+    font-weight: 600;
+}
+
+.danger-hint {
+    color: var(--acu-error);
+    font-weight: 500;
+}
+
+.cloud-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}
+
+.cloud-danger {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0.875rem 1rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.danger-title {
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--acu-error);
+}
+
+.danger-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--acu-border);
+}
+
+.danger-row:first-of-type {
+    border-top: none;
+    padding-top: 0;
+}
+
+.danger-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.danger-name {
+    margin: 0;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--acu-text);
+}
+
+.danger-desc {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--acu-text-muted);
+    line-height: 1.55;
+}
+
+.btn-ghost.danger {
+    color: var(--acu-error);
+    border-color: var(--acu-error);
+}
+
+.btn-ghost.danger:hover {
+    background: var(--acu-error-soft);
+    color: var(--acu-error);
+}
+
+.btn-danger {
+    height: 2.25rem;
+    padding: 0 1rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: #fff;
+    background: var(--acu-error);
+    border: 1px solid var(--acu-error);
+    border-radius: 0.5rem;
+    cursor: pointer;
+}
+
+.btn-danger:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.cloud-msg {
+    margin: 0;
+    font-size: 0.75rem;
+    word-break: break-all;
+}
+
+.cloud-msg.success {
+    color: var(--acu-success);
+}
+
+.cloud-msg.error {
+    color: var(--acu-error);
 }
 </style>
