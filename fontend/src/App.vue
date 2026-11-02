@@ -288,15 +288,156 @@ async function buildPayload({ files }) {
   return { summaries, images, useOcr }
 }
 
-function playAssistantTts(conversation, assistantNodeId) {
-  if (!ttsSettings.value.enabled) return
-  if (!ttsSettings.value.voice) return
-  const node = conversation?.nodes?.[assistantNodeId]
-  if (!node || node.role !== 'assistant') return
-  const clean = stripTtsMarkers(node.content)
-  if (!clean) return
-  const meta = extractTtsMeta(node.content)
-  tts.speak(clean, meta, ttsSettings.value.voice)
+// ===== TTS 句子级流水线 =====
+// 策略：等到 <TTS> 头部闭合、解析出 emotion/weight/lang 后，再开始处理正文。
+// stripTtsMarkers 对未闭合头部的剥离天然保证头部闭合前 visible 为空，
+// 所以这里只需要在每次 onDelta 开头尝试解析 meta 即可。
+const SENTENCE_END = /[。！？!?\n]/
+const TTS_META_RE = /<TTS>\s*(\{[\s\S]*?\})\s*<\/TTS>/i
+const EMOTION_KEYS = ['happy', 'angry', 'sad', 'fear', 'disgust', 'low', 'surprised', 'calm']
+const FALLBACK_META = { emotion: 'happy', weight: 0.7, lang: 'ZH' }
+
+function normalizeMeta(p) {
+  if (!p || typeof p !== 'object') return { ...FALLBACK_META }
+  const emotion = EMOTION_KEYS.includes(p.emotion) ? p.emotion : FALLBACK_META.emotion
+  const rawWeight = typeof p.weight === 'number' ? p.weight : FALLBACK_META.weight
+  const weight = Math.max(0, Math.min(1, rawWeight))
+  const lang = typeof p.lang === 'string' && p.lang ? p.lang : FALLBACK_META.lang
+  return { emotion, weight, lang }
+}
+
+function buildVector(emotion, weight) {
+  const v = {}
+  for (const k of EMOTION_KEYS) v[k] = 0
+  if (emotion in v) v[emotion] = weight
+  return v
+}
+
+function splitSentences(buffer, flush) {
+  const out = []
+  let rest = buffer
+  let idx
+  while ((idx = rest.search(SENTENCE_END)) >= 0) {
+    const end = idx + 1
+    const s = rest.slice(0, end).trim()
+    if (s) out.push(s)
+    rest = rest.slice(end)
+  }
+  while (rest.length > 80) {
+    const s = rest.slice(0, 80).trim()
+    if (s) out.push(s)
+    rest = rest.slice(80)
+  }
+  if (flush && rest.trim()) {
+    out.push(rest.trim())
+    rest = ''
+  }
+  return { completed: out, rest }
+}
+
+function createTtsPipeline(voice) {
+  let rawBuffer = ''
+  let lastVisible = ''
+  let sentenceBuffer = ''
+  let resolvedMeta = null
+  let metaResolved = false
+  let commitChain = Promise.resolve()
+  let playChain = Promise.resolve()
+  let cancelled = false
+  let commitRef = null
+
+  function tryResolveMeta() {
+    if (metaResolved) return
+    const m = TTS_META_RE.exec(rawBuffer)
+    if (!m) return
+    try {
+      const p = JSON.parse(m[1])
+      resolvedMeta = normalizeMeta(p)
+    } catch {
+      resolvedMeta = { ...FALLBACK_META }
+    }
+    metaResolved = true
+  }
+
+  function enqueue(text, commit) {
+    if (!text || cancelled) return
+    const meta = resolvedMeta || FALLBACK_META
+    const synthPromise = tts.synthesize(text, meta, voice).catch((e) => {
+      console.warn('[tts] 合成失败，降级为纯文本', e)
+      return null
+    })
+
+    commitChain = commitChain.then(async () => {
+      if (cancelled) {
+        try { const a = await synthPromise; if (a?.url) URL.revokeObjectURL(a.url) } catch { }
+        return
+      }
+      const audio = await synthPromise
+      commit(text)
+      if (audio?.url) {
+        playChain = playChain.then(() => {
+          if (cancelled) {
+            URL.revokeObjectURL(audio.url)
+            return
+          }
+          return tts.playUrl(audio.url)
+        }).catch(() => { })
+      }
+    }).catch((e) => {
+      console.warn('[tts] commit 链异常', e)
+    })
+  }
+
+  return {
+    onDelta(delta, commit) {
+      if (cancelled) return
+      commitRef = commit
+      rawBuffer += delta
+      if (!metaResolved) tryResolveMeta()
+
+      const visible = stripTtsMarkers(rawBuffer)
+      const newText = visible.slice(lastVisible.length)
+      lastVisible = visible
+      if (!newText) return
+
+      sentenceBuffer += newText
+      const { completed, rest } = splitSentences(sentenceBuffer, false)
+      for (const s of completed) enqueue(s, commit)
+      sentenceBuffer = rest
+    },
+
+    async onDone(commit) {
+      if (cancelled) return
+      commitRef = commit
+      const { completed } = splitSentences(sentenceBuffer, true)
+      for (const s of completed) enqueue(s, commit)
+      sentenceBuffer = ''
+      try { await commitChain } catch { }
+    },
+
+    onError() {
+      if (cancelled) return
+      cancelled = true
+      if (commitRef && sentenceBuffer) {
+        commitRef(sentenceBuffer)
+        sentenceBuffer = ''
+      }
+      tts.stop()
+    },
+
+    stop() {
+      cancelled = true
+      tts.stop()
+    },
+  }
+}
+
+// 用不上，保留以防其他地方引用
+function playAssistantTts() { }
+
+function buildTtsPipelineFor(ttsActive) {
+  if (!ttsActive) return null
+  return createTtsPipeline(ttsSettings.value.voice)
 }
 
 async function onSend({ text, files }) {
@@ -320,9 +461,11 @@ async function onSend({ text, files }) {
 
   const { summaries, images, useOcr } = await buildPayload({ files })
 
-  const finalSystemPrompt = ttsSettings.value.enabled
+  const ttsActive = ttsSettings.value.enabled && !!ttsSettings.value.voice
+  const finalSystemPrompt = ttsActive
     ? buildTtsSystemPrompt(userSystemPrompt.value)
     : userSystemPrompt.value
+  const ttsPipeline = buildTtsPipelineFor(ttsActive)
 
   const result = await chatStream.send({
     text: text || '',
@@ -333,9 +476,11 @@ async function onSend({ text, files }) {
     client,
     conversation: current,
     userSystemPrompt: finalSystemPrompt,
+    ttsPipeline,
   })
 
   if (result && !result.ok && result.isImageError && !useOcr) {
+    ttsPipeline?.stop()
     ocrEnabled.value = true
     showNotice('当前模型不支持图片输入，已自动开启 OCR，正在改用图片文字重试...')
     if (result.userNodeId) {
@@ -343,10 +488,6 @@ async function onSend({ text, files }) {
     }
     await onSend({ text, files })
     return
-  }
-
-  if (result?.ok && result.assistantId) {
-    playAssistantTts(current, result.assistantId)
   }
 }
 
@@ -392,22 +533,21 @@ async function onEditMessage({ nodeId, content }) {
   const newNode = await editUserMessage(nodeId, content)
   if (!newNode) return
 
-  const finalSystemPrompt = ttsSettings.value.enabled
+  const ttsActive = ttsSettings.value.enabled && !!ttsSettings.value.voice
+  const finalSystemPrompt = ttsActive
     ? buildTtsSystemPrompt(userSystemPrompt.value)
     : userSystemPrompt.value
+  const ttsPipeline = buildTtsPipelineFor(ttsActive)
 
-  const result = await chatStream.generateAssistant({
+  await chatStream.generateAssistant({
     userNodeId: newNode.id,
     provider: currentProvider.value,
     model: currentModel.value,
     client,
     conversation: current,
     userSystemPrompt: finalSystemPrompt,
+    ttsPipeline,
   })
-
-  if (result?.ok && result.assistantId) {
-    playAssistantTts(current, result.assistantId)
-  }
 }
 
 async function onRegenerate(nodeId) {
@@ -420,9 +560,11 @@ async function onRegenerate(nodeId) {
     return
   }
 
-  const finalSystemPrompt = ttsSettings.value.enabled
+  const ttsActive = ttsSettings.value.enabled && !!ttsSettings.value.voice
+  const finalSystemPrompt = ttsActive
     ? buildTtsSystemPrompt(userSystemPrompt.value)
     : userSystemPrompt.value
+  const ttsPipeline = buildTtsPipelineFor(ttsActive)
 
   const result = await chatStream.regenerate({
     assistantNodeId: nodeId,
@@ -431,16 +573,14 @@ async function onRegenerate(nodeId) {
     client,
     conversation: current,
     userSystemPrompt: finalSystemPrompt,
+    ttsPipeline,
   })
 
   if (result && !result.ok && result.isImageError && !ocrEnabled.value) {
+    ttsPipeline?.stop()
     ocrEnabled.value = true
     showNotice('当前模型不支持图片输入，已自动开启 OCR，请再点一次「重新生成」')
     return
-  }
-
-  if (result?.ok && result.assistantId) {
-    playAssistantTts(current, result.assistantId)
   }
 }
 
@@ -644,10 +784,11 @@ onUnmounted(() => {
             <span class="ocr-progress-value">{{ ocrProgress }}%</span>
           </div>
 
-          <div v-if="tts.playing.value || tts.loading.value" class="tts-status">
+          <div v-if="ttsSettings.enabled" class="tts-status"
+            :style="{ visibility: (tts.playing.value || tts.loading.value) ? 'visible' : 'hidden' }">
             <span class="tts-status-dot" />
             <span>{{ tts.loading.value ? '语音合成中…' : '正在播放语音' }}</span>
-            <button v-if="tts.playing.value" class="tts-stop-btn" @click="tts.stop()">停止</button>
+            <button class="tts-stop-btn" :disabled="!tts.playing.value" @click="tts.stop()">停止</button>
           </div>
         </div>
       </main>

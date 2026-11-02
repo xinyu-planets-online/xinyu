@@ -55,6 +55,7 @@ export function useChatStream({ addNode }) {
         client,
         conversation,
         userSystemPrompt,
+        ttsPipeline = null,
     }) {
         if (!client) {
             return { ok: false, error: new Error('llm-hub-config 尚未就绪') }
@@ -78,15 +79,37 @@ export function useChatStream({ addNode }) {
         conversation.currentLeafId = assistant.id
         conversation.updatedAt = Date.now()
 
+        let fullText = ''
+
+        const commit = (text) => {
+            if (!text) return
+            streaming.append(assistant, { type: 'content', delta: text })
+        }
+
         try {
             const stream = client.chatStream({ provider, model, messages })
             for await (const chunk of stream) {
-                streaming.append(assistant, { type: 'content', delta: chunk.delta })
+                fullText += chunk.delta
+                if (ttsPipeline) {
+                    ttsPipeline.onDelta(chunk.delta, commit)
+                } else {
+                    commit(chunk.delta)
+                }
             }
+
+            if (ttsPipeline) {
+                await ttsPipeline.onDone(commit)
+            }
+
             streaming.append(assistant, { type: 'done', delta: '' })
             return { ok: true, assistantId: assistant.id }
         } catch (err) {
             const isImageError = isImageUnsupportedError(err)
+            if (ttsPipeline && typeof ttsPipeline.onError === 'function') {
+                ttsPipeline.onError()
+            } else if (fullText) {
+                commit(fullText)
+            }
             streaming.append(assistant, {
                 type: 'error',
                 delta: isImageError
@@ -110,6 +133,7 @@ export function useChatStream({ addNode }) {
         client,
         conversation,
         userSystemPrompt,
+        ttsPipeline = null,
     }) {
         if (!text?.trim() && !files.length && !images.length) {
             return { ok: false, error: new Error('空消息') }
@@ -138,6 +162,7 @@ export function useChatStream({ addNode }) {
             client,
             conversation,
             userSystemPrompt,
+            ttsPipeline,
         })
 
         return { ...result, userNodeId: userNode.id }
@@ -150,6 +175,7 @@ export function useChatStream({ addNode }) {
         client,
         conversation,
         userSystemPrompt,
+        ttsPipeline = null,
     }) {
         const node = conversation?.nodes[assistantNodeId]
         if (!node || node.role !== 'assistant') {
@@ -162,6 +188,7 @@ export function useChatStream({ addNode }) {
             client,
             conversation,
             userSystemPrompt,
+            ttsPipeline,
         })
     }
 
