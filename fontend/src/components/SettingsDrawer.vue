@@ -5,6 +5,7 @@ import * as allProviders from '@inteye/llm-hub/providers'
 import { createCustomProvider } from '@inteye/llm-hub/providers'
 import { encryptPayload, decryptPayload } from '@/utils/securePayload'
 import LoginModal from '@/components/LoginModal.vue'
+import TtsVoicePicker from '@/components/TtsVoicePicker.vue'
 import { exportAll, importAll, listConversations } from '@/db/chatRepository'
 
 const props = defineProps({
@@ -14,10 +15,12 @@ const props = defineProps({
     models: { type: Array, default: () => [] },
     themeMode: { type: String, default: 'auto' },
     userSystemPrompt: { type: String, default: '' },
+    ttsSettings: { type: Object, default: () => ({}) },
 })
 
 const emit = defineEmits([
     'close', 'update:themeMode', 'update:userSystemPrompt',
+    'update:ttsSettings', 'tts-preview',
     'switch-model', 'remove-model', 'add-model',
     'data-imported', 'data-cleared',
 ])
@@ -69,7 +72,6 @@ const BUILTIN_MODELS = {
 
 const NO_KEY_REQUIRED = ['ollama', 'lmstudio', 'localai']
 
-// ============ 自定义端点持久化 ============
 const CUSTOM_ENDPOINTS_STORAGE_KEY = 'llm-hub-custom-endpoints'
 
 function loadCustomEndpoints() {
@@ -85,10 +87,8 @@ function persistCustomEndpoints() {
     } catch { }
 }
 
-// 每个端点: { name, displayName, baseURL, apiKey, protocol, model }
 const customEndpoints = ref(loadCustomEndpoints())
 
-// ============ Client 创建（多自定义端点） ============
 const clientRef = shallowRef(null)
 
 async function buildClient() {
@@ -115,7 +115,6 @@ async function buildClient() {
     const newClient = createClient({ storage: 'localStorage', providers })
 
     for (const ep of customEndpoints.value) {
-        // 本地端点也传入一个非空占位 Key，避免被判定为“无 access”
         const effectiveApiKey = ep.apiKey?.trim() || 'local-no-key'
 
         await newClient.configure(ep.name, {
@@ -155,6 +154,7 @@ const activeTab = ref('model')
 const tabs = [
     { key: 'model', label: '模型' },
     { key: 'prompt', label: '提示词' },
+    { key: 'tts', label: '语音' },
     { key: 'cloud', label: '云备份' },
     { key: 'appearance', label: '外观' },
 ]
@@ -164,7 +164,6 @@ function backToMain() { view.value = 'main' }
 
 watch(() => props.showSettings, v => { if (v) view.value = 'main' })
 
-// ============ 模型拉取 ============
 const remoteModels = ref([])
 const modelsLoading = ref(false)
 const modelsError = ref('')
@@ -218,7 +217,6 @@ async function fetchCustomModels() {
     }
 }
 
-// ============ 表单 ============
 const formOpen = ref(false)
 const editingItem = ref(null)
 const formError = ref('')
@@ -457,7 +455,6 @@ async function onRemoveCustomEndpoint(ep) {
     emit('remove-model', ep.name)
 }
 
-// 提示词 & 外观
 const promptDraft = ref(props.userSystemPrompt)
 watch(() => props.userSystemPrompt, v => { promptDraft.value = v })
 let promptTimer = null
@@ -473,27 +470,34 @@ const themeOptions = [
 ]
 function selectTheme(v) { emit('update:themeMode', v) }
 
-// ============ 云备份（新增，独立于 useConversations 的导出导入流程） ============
-// 约束：
-// 1. 切到 cloud tab 时按需检测登录；未登录强引导登录；任何 401 都弹登录框
-// 2. PUT / DELETE 前先拉 /v1/chat-data/info 并展示为确认提示；PUT 面板允许填写 custom_summary
-// 3. 加密密码独立于账户密码，不写入任何持久化存储；上传 / 拉取成功后清空，关闭抽屉或切走 tab 也清空
-// 4. 删除服务器备份 / 清空浏览器数据：两条路径互斥，各自独立二次确认
+// ============ TTS ============
+function updateTts(patch) {
+    emit('update:ttsSettings', { ...(props.ttsSettings || {}), ...patch })
+}
 
+function onVoiceChange(voice) {
+    updateTts({ voice })
+}
+
+function previewTts() {
+    emit('tts-preview')
+}
+
+// ============ 云备份 ============
 const CLOUD_INFO_URL = '/v1/chat-data/info'
 const CLOUD_DATA_URL = '/v1/chat-data'
 const ACTIVE_KEY = 'chat-active-id'
 
-const cloudStatus = ref('idle')         // idle | checking | logged-in | logged-out | error
-const cloudInfo = ref(null)             // /v1/chat-data/info 响应体
-const cloudLocalStats = ref(null)       // 上传面板打开时统计的本地数据量
+const cloudStatus = ref('idle')
+const cloudInfo = ref(null)
+const cloudLocalStats = ref(null)
 const cloudPassword = ref('')
 const showCloudPassword = ref(false)
 const cloudSummaryDraft = ref('')
 const cloudBusy = ref(false)
 const cloudMsg = ref('')
-const cloudMsgType = ref('')            // success | error
-const cloudAction = ref(null)           // null | 'upload' | 'delete' | 'wipe-local'
+const cloudMsgType = ref('')
+const cloudAction = ref(null)
 const loginModalOpen = ref(false)
 
 function fmtTime(iso) {
@@ -503,7 +507,6 @@ function fmtTime(iso) {
 
 function resetCloudMsg() { cloudMsg.value = ''; cloudMsgType.value = '' }
 
-// 切到 cloud tab 按需检测；切走清空一次性状态
 watch(activeTab, (v) => {
     if (v === 'cloud') {
         if (cloudStatus.value === 'idle') checkCloudAuth()
@@ -516,7 +519,6 @@ watch(activeTab, (v) => {
     }
 })
 
-// 关闭抽屉清空密码与一次性状态
 watch(() => props.showSettings, (v) => {
     if (!v) {
         cloudPassword.value = ''
@@ -540,7 +542,6 @@ async function fetchCloudInfo() {
         if (r.status === 401) return { ok: false, status: 401, reason: 'unauthorized' }
         if (!r.ok) return { ok: false, status: r.status, reason: 'http' }
 
-        // 被重定向到登录页 / 其他路径：最终 URL 与请求路径不一致
         try {
             const expected = new URL(CLOUD_INFO_URL, location.origin)
             const finalUrl = new URL(r.url, location.origin)
@@ -585,7 +586,6 @@ async function checkCloudAuth() {
         cloudMsgType.value = 'error'
         return
     }
-    // unauthorized / redirected / not-json / bad-json / bad-shape 一律视为未登录
     cloudStatus.value = 'logged-out'
 }
 
@@ -616,7 +616,6 @@ function cancelAction() {
     cloudLocalStats.value = null
 }
 
-// 计算本地可上传的非空对话数（与陈述 2.2 空会话判定一致）
 async function computeLocalStats() {
     cloudLocalStats.value = null
     try {
@@ -640,7 +639,6 @@ async function computeLocalStats() {
     }
 }
 
-// 构建上传 payload（复用陈述 2.2 空会话过滤，全程只读三表）
 async function buildCloudPayload() {
     const all = await exportAll()
     const msgsByConv = new Map()
@@ -664,7 +662,6 @@ async function buildCloudPayload() {
     }
 }
 
-// 导入 payload（与 useConversations.handleImport 的去重规则一致：仅按 conversation.id）
 async function importCloudPayload(data) {
     if (!data || !Array.isArray(data.conversations)) throw new Error('数据格式不正确')
     const existing = new Set((await listConversations()).map(c => c.id))
@@ -677,7 +674,6 @@ async function importCloudPayload(data) {
     return { added: convs.length, skipped: data.conversations.length - convs.length }
 }
 
-// -------- 上传：先拉 info 展示为确认提示 --------
 async function startUpload() {
     resetCloudMsg()
     if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
@@ -736,7 +732,6 @@ async function confirmUpload() {
         }
         if (!r.ok) { cloudMsg.value = `上传失败：HTTP ${r.status}`; cloudMsgType.value = 'error'; return }
 
-        // 200 也要校验是否被重定向到登录页
         const ct = (r.headers.get('Content-Type') || '').toLowerCase()
         if (!ct.includes('application/json')) { handle401(); return }
         const resp = await r.json().catch(() => null)
@@ -749,7 +744,6 @@ async function confirmUpload() {
     }
 }
 
-// -------- 拉取并导入 --------
 async function pullFromCloud() {
     resetCloudMsg()
     if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
@@ -804,7 +798,6 @@ async function pullFromCloud() {
     }
 }
 
-// -------- 删除服务器备份：先拉 info 展示为确认提示 --------
 async function startDeleteServer() {
     resetCloudMsg()
     if (cloudStatus.value !== 'logged-in') { cloudMsg.value = '请先登录'; cloudMsgType.value = 'error'; return }
@@ -848,7 +841,6 @@ async function confirmDeleteServer() {
         if (r.status === 401) { handle401(); return }
         if (r.status === 403) { cloudMsg.value = '同源校验失败'; cloudMsgType.value = 'error'; return }
         if (r.ok) {
-            // 约定成功是 204；200/其他 2xx 大概率是被重定向到登录页
             handle401()
             return
         }
@@ -859,7 +851,6 @@ async function confirmDeleteServer() {
     }
 }
 
-// -------- 清空浏览器数据（本地操作，无需密码、无需 info） --------
 function startWipeLocal() {
     resetCloudMsg()
     cloudAction.value = 'wipe-local'
@@ -1167,6 +1158,35 @@ async function confirmWipeLocal() {
                                 </div>
                             </section>
 
+                            <section v-if="activeTab === 'tts'" class="tab-pane">
+                                <header class="pane-head">
+                                    <h3 class="pane-title">语音合成</h3>
+                                    <p class="pane-desc">启用后，AI 回复会自动转换为语音播放。情绪由模型根据内容自动控制，无需手动设置。</p>
+                                </header>
+
+                                <label class="switch-row">
+                                    <input type="checkbox" class="switch-input" :checked="!!ttsSettings.enabled"
+                                        @change="updateTts({ enabled: $event.target.checked })" />
+                                    <span class="switch-track"><span class="switch-thumb" /></span>
+                                    <span class="switch-label">
+                                        {{ ttsSettings.enabled ? '已启用语音合成' : '未启用语音合成' }}
+                                    </span>
+                                </label>
+
+                                <template v-if="ttsSettings.enabled">
+                                    <TtsVoicePicker :model-value="ttsSettings.voice"
+                                        @update:model-value="onVoiceChange" />
+
+                                    <button class="preview-btn" :disabled="!ttsSettings.voice"
+                                        @click="previewTts">试听当前音色</button>
+
+                                    <div class="note">
+                                        <p>预设音色由服务端提供，只读；自定义音色存于本浏览器 IndexedDB，可随时增删。</p>
+                                        <p>情绪、语速、强度由模型在回复中自动给出，用户无需也无法调整。</p>
+                                    </div>
+                                </template>
+                            </section>
+
                             <section v-if="activeTab === 'cloud'" class="tab-pane">
                                 <header class="pane-head">
                                     <h3 class="pane-title">云备份</h3>
@@ -1406,7 +1426,7 @@ async function confirmWipeLocal() {
 </template>
 
 <style scoped>
-/* 原有样式全部保留 */
+/* 原有样式保留 */
 .custom-endpoints-section {
     display: flex;
     flex-direction: column;
@@ -2285,9 +2305,97 @@ async function confirmWipeLocal() {
     .settings-leave-active .settings-panel {
         transition: none;
     }
+
+    .switch-track,
+    .switch-thumb {
+        transition: none;
+    }
 }
 
-/* ============ 云备份（新增） ============ */
+/* ============ TTS ============ */
+.switch-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--acu-surface);
+    border: 1px solid var(--acu-border);
+    border-radius: 0.75rem;
+    cursor: pointer;
+    user-select: none;
+}
+
+.switch-input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.switch-track {
+    position: relative;
+    flex: 0 0 auto;
+    width: 2.25rem;
+    height: 1.25rem;
+    border-radius: 999rem;
+    background: var(--acu-border-strong);
+    transition: background 0.2s ease;
+}
+
+.switch-thumb {
+    position: absolute;
+    top: 0.125rem;
+    left: 0.125rem;
+    width: 1rem;
+    height: 1rem;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    transition: transform 0.2s ease;
+}
+
+.switch-input:checked+.switch-track {
+    background: var(--acu-primary);
+}
+
+.switch-input:checked+.switch-track .switch-thumb {
+    transform: translateX(1rem);
+}
+
+.switch-input:focus-visible+.switch-track {
+    outline: 2px solid var(--acu-primary);
+    outline-offset: 2px;
+}
+
+.switch-label {
+    flex: 1 1 auto;
+    font-size: 0.8125rem;
+    color: var(--acu-text);
+}
+
+.preview-btn {
+    align-self: flex-start;
+    height: 2.25rem;
+    padding: 0 1rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--acu-primary-contrast);
+    background: var(--acu-primary);
+    border: 1px solid var(--acu-primary);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.preview-btn:hover:not(:disabled) {
+    background: var(--acu-primary-hover);
+}
+
+.preview-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ============ 云备份 ============ */
 .cloud-auth {
     display: flex;
     align-items: center;

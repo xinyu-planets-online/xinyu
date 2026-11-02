@@ -22,6 +22,8 @@ import { useChatStream } from './composables/useChatStream'
 import { useUserSystemPrompt } from './composables/useSystemPrompts'
 import { summarizeFile, unwrapFile } from './composables/useAttachmentSummary'
 import { useLocalOcr } from './composables/useLocalOcr'
+import { useTts, stripTtsMarkers, extractTtsMeta, buildTtsSystemPrompt } from './composables/useTts'
+import { useTtsSettings } from './composables/useTtsSettings'
 
 const SELECTION_KEY = 'chat-selection'
 const MODELS_KEY = 'chat-models'
@@ -36,6 +38,26 @@ const { notice, showNotice, cleanup: cleanupNotice } = useNotice()
 const { userSystemPrompt } = useUserSystemPrompt()
 
 const { isRecognizing, ocrStatus, ocrProgress, recognize } = useLocalOcr()
+
+const ttsSettings = useTtsSettings()
+const tts = useTts(ttsSettings)
+
+function updateTtsSettings(patch) {
+  Object.assign(ttsSettings.value, patch)
+}
+
+function previewTts() {
+  const s = ttsSettings.value
+  if (!s.enabled) {
+    showNotice('请先启用语音合成')
+    return
+  }
+  if (!s.voice) {
+    showNotice('请先选择一个音色')
+    return
+  }
+  tts.speak('你好，这是一段试听语音。', { emotion: 'happy', weight: 0.6, lang: 'ZH' }, s.voice)
+}
 
 const ocrEnabled = ref(false)
 try {
@@ -58,7 +80,6 @@ const settingsRef = ref(null)
 const voiceBaseText = ref('')
 const models = ref([])
 
-// 图片灯箱
 const imageViewerVisible = ref(false)
 const imageViewerSrc = ref('')
 
@@ -165,20 +186,24 @@ const {
   loadConversations,
 } = conv
 
-// 渲染用消息：有图片的节点在 content 末尾追加 Markdown 图片语法
 const displayMessages = computed(() =>
   messages.value.map((m) => {
-    const imgs = m.images || []
-    if (!imgs.length) return m
-    const md = imgs
-      .filter((img) => img?.dataUrl)
-      .map((img) => `![图片](${img.dataUrl})`)
-      .join('\n\n')
-    if (!md) return m
-    return {
-      ...m,
-      content: m.content ? `${m.content}\n\n${md}` : md,
+    let content = m.content || ''
+    if (m.role === 'assistant') {
+      content = stripTtsMarkers(content)
     }
+
+    const imgs = m.images || []
+    if (imgs.length) {
+      const md = imgs
+        .filter((img) => img?.dataUrl)
+        .map((img) => `![图片](${img.dataUrl})`)
+        .join('\n\n')
+      if (md) content = content ? `${content}\n\n${md}` : md
+    }
+
+    if (content === (m.content || '') && !imgs.length) return m
+    return { ...m, content }
   })
 )
 
@@ -216,9 +241,6 @@ async function buildPayload({ files }) {
   const summaries = []
   const images = []
 
-  // 语义：
-  // OCR 关 -> 只发图片本体（多模态）
-  // OCR 开 -> 只发 OCR 文本，不发图片
   const useOcr = hasFiles && ocrEnabled.value
 
   if (hasFiles) {
@@ -266,6 +288,17 @@ async function buildPayload({ files }) {
   return { summaries, images, useOcr }
 }
 
+function playAssistantTts(conversation, assistantNodeId) {
+  if (!ttsSettings.value.enabled) return
+  if (!ttsSettings.value.voice) return
+  const node = conversation?.nodes?.[assistantNodeId]
+  if (!node || node.role !== 'assistant') return
+  const clean = stripTtsMarkers(node.content)
+  if (!clean) return
+  const meta = extractTtsMeta(node.content)
+  tts.speak(clean, meta, ttsSettings.value.voice)
+}
+
 async function onSend({ text, files }) {
   const hasText = !!text?.trim()
   const hasFiles = Array.isArray(files) && files.length > 0
@@ -287,6 +320,10 @@ async function onSend({ text, files }) {
 
   const { summaries, images, useOcr } = await buildPayload({ files })
 
+  const finalSystemPrompt = ttsSettings.value.enabled
+    ? buildTtsSystemPrompt(userSystemPrompt.value)
+    : userSystemPrompt.value
+
   const result = await chatStream.send({
     text: text || '',
     files: summaries,
@@ -295,24 +332,21 @@ async function onSend({ text, files }) {
     model: modelName,
     client,
     conversation: current,
-    userSystemPrompt: userSystemPrompt.value,
+    userSystemPrompt: finalSystemPrompt,
   })
 
-  // 图片不支持：自动开 OCR、回滚、重试
   if (result && !result.ok && result.isImageError && !useOcr) {
     ocrEnabled.value = true
     showNotice('当前模型不支持图片输入，已自动开启 OCR，正在改用图片文字重试...')
-
     if (result.userNodeId) {
-      try {
-        await revertToNode(result.userNodeId)
-      } catch (e) {
-        console.warn('[retry] 回滚失败', e)
-      }
+      try { await revertToNode(result.userNodeId) } catch (e) { console.warn('[retry] 回滚失败', e) }
     }
-
-    // 递归重试：此时 ocrEnabled 已为 true，会走 OCR 路径，不再发图片
     await onSend({ text, files })
+    return
+  }
+
+  if (result?.ok && result.assistantId) {
+    playAssistantTts(current, result.assistantId)
   }
 }
 
@@ -357,14 +391,23 @@ async function onEditMessage({ nodeId, content }) {
   }
   const newNode = await editUserMessage(nodeId, content)
   if (!newNode) return
-  await chatStream.generateAssistant({
+
+  const finalSystemPrompt = ttsSettings.value.enabled
+    ? buildTtsSystemPrompt(userSystemPrompt.value)
+    : userSystemPrompt.value
+
+  const result = await chatStream.generateAssistant({
     userNodeId: newNode.id,
     provider: currentProvider.value,
     model: currentModel.value,
     client,
     conversation: current,
-    userSystemPrompt: userSystemPrompt.value,
+    userSystemPrompt: finalSystemPrompt,
   })
+
+  if (result?.ok && result.assistantId) {
+    playAssistantTts(current, result.assistantId)
+  }
 }
 
 async function onRegenerate(nodeId) {
@@ -376,19 +419,28 @@ async function onRegenerate(nodeId) {
     showSettings.value = true
     return
   }
+
+  const finalSystemPrompt = ttsSettings.value.enabled
+    ? buildTtsSystemPrompt(userSystemPrompt.value)
+    : userSystemPrompt.value
+
   const result = await chatStream.regenerate({
     assistantNodeId: nodeId,
     provider: currentProvider.value,
     model: currentModel.value,
     client,
     conversation: current,
-    userSystemPrompt: userSystemPrompt.value,
+    userSystemPrompt: finalSystemPrompt,
   })
 
-  // 重新生成也可能命中图片错误
   if (result && !result.ok && result.isImageError && !ocrEnabled.value) {
     ocrEnabled.value = true
     showNotice('当前模型不支持图片输入，已自动开启 OCR，请再点一次「重新生成」')
+    return
+  }
+
+  if (result?.ok && result.assistantId) {
+    playAssistantTts(current, result.assistantId)
   }
 }
 
@@ -461,7 +513,6 @@ async function attachActionBars(retry = 0) {
 watch(() => messages.value.map(m => m.id).join('|'), () => attachActionBars(), { immediate: true })
 
 function onWrapperClickCapture(e) {
-  // 优先处理图片点击：打开原图灯箱
   const img = e.target.closest('img')
   if (img && chatWrapper.value?.contains(img)) {
     const src = img.getAttribute('src') || ''
@@ -502,12 +553,10 @@ function onWrapperClickCapture(e) {
   }
 }
 
-// 云备份：拉取并导入成功后，重新读表刷新侧栏与当前会话
 function handleCloudImported() {
   loadConversations()
 }
 
-// 云备份：清空浏览器数据后，直接刷新页面
 function handleCloudCleared() {
   location.reload()
 }
@@ -527,6 +576,7 @@ onUnmounted(() => {
   document.removeEventListener('llm-hub-select', onLLMHubSelect)
   chatWrapper.value?.removeEventListener('click', onWrapperClickCapture, true)
   chatWrapper.value?.removeEventListener('input', onInputDelegate)
+  tts.stop()
   destroyTheme()
   cleanupNotice()
 })
@@ -558,7 +608,6 @@ onUnmounted(() => {
             welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
             @select="onPresetSelect" />
 
-          <!-- 聊天工具条：语音输入 + OCR 开关 -->
           <div class="chat-toolbar">
             <VoiceInputButton :base-text="voiceBaseText" @update="onVoiceUpdate" @finish="onVoiceFinish" />
 
@@ -572,15 +621,33 @@ onUnmounted(() => {
               </svg>
               <span>{{ ocrEnabled ? 'OCR 开' : 'OCR 关' }}</span>
             </button>
+
+            <button class="tts-toggle" :class="{ active: ttsSettings.enabled }"
+              :title="ttsSettings.enabled ? '关闭语音合成' : '开启语音合成'"
+              @click="updateTtsSettings({ enabled: !ttsSettings.enabled })">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M3 6v4h2l3 2V4L5 6H3z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+                <path v-if="ttsSettings.enabled" d="M11 6c.7.5 1 1.2 1 2s-.3 1.5-1 2" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" />
+                <path v-else d="M11 5.5l3 3M14 5.5l-3 3" stroke="currentColor" stroke-width="1.4"
+                  stroke-linecap="round" />
+              </svg>
+              <span>{{ ttsSettings.enabled ? 'TTS 开' : 'TTS 关' }}</span>
+            </button>
           </div>
 
-          <!-- 本地 OCR 进度 -->
           <div v-if="isRecognizing" class="ocr-progress">
             <span class="ocr-progress-label">{{ ocrStatus }}</span>
             <div class="ocr-progress-track">
               <div class="ocr-progress-fill" :style="{ width: ocrProgress + '%' }" />
             </div>
             <span class="ocr-progress-value">{{ ocrProgress }}%</span>
+          </div>
+
+          <div v-if="tts.playing.value || tts.loading.value" class="tts-status">
+            <span class="tts-status-dot" />
+            <span>{{ tts.loading.value ? '语音合成中…' : '正在播放语音' }}</span>
+            <button v-if="tts.playing.value" class="tts-stop-btn" @click="tts.stop()">停止</button>
           </div>
         </div>
       </main>
@@ -609,9 +676,10 @@ onUnmounted(() => {
 
     <SettingsDrawer ref="settingsRef" :show-settings="showSettings" :current-provider="currentProvider"
       :current-model="currentModel" :models="models" :theme-mode="themeMode" :user-system-prompt="userSystemPrompt"
-      @close="showSettings = false" @update:theme-mode="themeMode = $event"
-      @update:user-system-prompt="userSystemPrompt = $event" @switch-model="switchModel" @remove-model="removeModel"
-      @add-model="onAddModel" @data-imported="handleCloudImported" @data-cleared="handleCloudCleared" />
+      :tts-settings="ttsSettings" @close="showSettings = false" @update:theme-mode="themeMode = $event"
+      @update:user-system-prompt="userSystemPrompt = $event" @update:tts-settings="updateTtsSettings"
+      @tts-preview="previewTts" @switch-model="switchModel" @remove-model="removeModel" @add-model="onAddModel"
+      @data-imported="handleCloudImported" @data-cleared="handleCloudCleared" />
   </div>
 </template>
 
@@ -681,9 +749,11 @@ onUnmounted(() => {
   gap: 0.5rem;
   margin-top: -0.5rem;
   margin-bottom: 0.5rem;
+  flex-wrap: wrap;
 }
 
-.ocr-toggle {
+.ocr-toggle,
+.tts-toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.375rem;
@@ -698,24 +768,28 @@ onUnmounted(() => {
   transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
-.ocr-toggle svg {
+.ocr-toggle svg,
+.tts-toggle svg {
   width: 0.875rem;
   height: 0.875rem;
 }
 
-.ocr-toggle:hover {
+.ocr-toggle:hover,
+.tts-toggle:hover {
   color: var(--acu-primary);
   background: var(--acu-primary-soft);
   border-color: var(--acu-primary-soft);
 }
 
-.ocr-toggle.active {
+.ocr-toggle.active,
+.tts-toggle.active {
   color: var(--acu-primary-contrast);
   background: var(--acu-primary);
   border-color: var(--acu-primary);
 }
 
-.ocr-toggle:focus-visible {
+.ocr-toggle:focus-visible,
+.tts-toggle:focus-visible {
   outline: 2px solid var(--acu-primary);
   outline-offset: 2px;
 }
@@ -754,6 +828,55 @@ onUnmounted(() => {
   min-width: 2.5rem;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+.tts-status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.75rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--acu-text-muted);
+}
+
+.tts-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--acu-primary);
+  animation: tts-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes tts-pulse {
+
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.3);
+  }
+}
+
+.tts-stop-btn {
+  margin-left: auto;
+  height: 1.75rem;
+  padding: 0 0.625rem;
+  font-size: 0.75rem;
+  color: var(--acu-text-secondary);
+  background: var(--acu-surface);
+  border: 1px solid var(--acu-border);
+  border-radius: 0.375rem;
+  cursor: pointer;
+}
+
+.tts-stop-btn:hover {
+  color: var(--acu-error);
+  border-color: var(--acu-error);
 }
 
 .hint {
@@ -803,7 +926,6 @@ onUnmounted(() => {
   display: none;
 }
 
-/* 缩略图：固定尺寸 + object-fit 裁剪，点击放大 */
 :deep(.acu-md img) {
   display: block;
   width: 12rem;
@@ -948,8 +1070,13 @@ onUnmounted(() => {
   }
 
   .ocr-progress-fill,
-  .ocr-toggle {
+  .ocr-toggle,
+  .tts-toggle {
     transition: none;
+  }
+
+  .tts-status-dot {
+    animation: none;
   }
 }
 </style>
