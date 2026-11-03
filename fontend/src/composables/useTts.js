@@ -54,6 +54,9 @@ const PRESET_API = '/tts/preset'
 const presetCache = new Map()
 
 async function loadPresetParams(name) {
+    if (!name || typeof name !== 'string') {
+        throw new Error('预设名称为空，请在设置里重新选择音色')
+    }
     if (presetCache.has(name)) return presetCache.get(name)
     const r = await fetch(`${PRESET_API}/load`, {
         method: 'POST',
@@ -71,12 +74,19 @@ export function clearPresetCache() {
 }
 
 async function buildPromptAudio(voice) {
+    if (!voice || !voice.type) {
+        throw new Error('未选择音色，请在设置里选择一个预设或自定义音色')
+    }
     if (voice.type === 'preset') {
+        if (!voice.name || typeof voice.name !== 'string') {
+            throw new Error('预设音色名称丢失，请在设置里重新选择')
+        }
         const cached = await loadPresetParams(voice.name)
         if (!cached.prompt_audio) throw new Error('预设没有可用的参考音频')
         return { kind: 'field', value: cached.prompt_audio }
     }
     if (voice.type === 'custom') {
+        if (!voice.id) throw new Error('自定义音色 ID 丢失，请在设置里重新选择')
         const rec = await getVoice(voice.id)
         if (!rec?.audioBlob) throw new Error('自定义音色丢失，请重新添加')
         return { kind: 'file', value: rec.audioBlob, filename: (voice.name || 'voice') + '.wav' }

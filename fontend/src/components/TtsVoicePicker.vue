@@ -21,15 +21,17 @@ const addError = ref('')
 
 const allVoices = computed(() => [
     ...presets.value.map(p => ({
-        key: `preset:${p.name}`,
+        key: `preset:${p.value}`,
         type: 'preset',
-        name: p.name,
+        name: p.value,
+        label: p.label,
     })),
     ...customVoices.value.map(c => ({
         key: `custom:${c.id}`,
         type: 'custom',
         id: c.id,
         name: c.name,
+        label: c.name,
     })),
 ])
 
@@ -68,7 +70,23 @@ async function loadPresets() {
         })
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const data = await r.json()
-        presets.value = (data.names || []).map(name => ({ name }))
+        const raw = Array.isArray(data?.names) ? data.names : []
+        presets.value = raw
+            .map(item => {
+                // Gradio dropdown choices: [value, label]；兼容纯字符串
+                if (Array.isArray(item)) {
+                    const value = typeof item[0] === 'string' ? item[0].trim() : ''
+                    const label = typeof item[1] === 'string' && item[1].trim() ? item[1].trim() : value
+                    if (!value) return null
+                    return { value, label: label || value }
+                }
+                if (typeof item === 'string' && item.trim()) {
+                    const v = item.trim()
+                    return { value: v, label: v }
+                }
+                return null
+            })
+            .filter(Boolean)
     } catch (e) {
         console.warn('[tts] 加载预设失败', e)
         presets.value = []
@@ -143,14 +161,27 @@ async function removeCurrent() {
     }
 }
 
+// 已选 voice 失效时自动清空，避免下拉显示已选但请求 400
+watch(
+    () => [presets.value, customVoices.value, props.modelValue],
+    () => {
+        const v = props.modelValue
+        if (!v) return
+        if (v.type === 'preset' && presets.value.length > 0) {
+            const ok = presets.value.some(p => p.value === v.name)
+            if (!ok) emit('update:modelValue', null)
+        } else if (v.type === 'custom' && customVoices.value.length > 0) {
+            const ok = customVoices.value.some(c => c.id === v.id)
+            if (!ok) emit('update:modelValue', null)
+        }
+    },
+    { deep: true }
+)
+
 onMounted(() => {
     loadPresets()
     loadCustom()
 })
-
-watch(() => props.modelValue, (v) => {
-    // 当外部重置 voice 时，同步内部状态
-}, { deep: true })
 </script>
 
 <template>
@@ -161,11 +192,11 @@ watch(() => props.modelValue, (v) => {
                 <option value="">— 未选择 —</option>
                 <optgroup label="预设音色" v-if="presets.length">
                     <option v-for="v in allVoices.filter(x => x.type === 'preset')" :key="v.key" :value="v.key">{{
-                        v.name }}</option>
+                        v.label }}</option>
                 </optgroup>
                 <optgroup label="自定义音色" v-if="customVoices.length">
                     <option v-for="v in allVoices.filter(x => x.type === 'custom')" :key="v.key" :value="v.key">{{
-                        v.name }}</option>
+                        v.label }}</option>
                 </optgroup>
             </select>
             <span class="field-hint">
