@@ -2,16 +2,16 @@
     <div ref="stageRef" class="stage" @click="onClick">
         <div ref="scrollerRef" class="scroller" @scroll.passive="onScroll">
             <div class="content" :style="{ height: contentH + 'px' }">
-                <img ref="imgRef" class="content__img" src="/design.jpg" :style="{ top: offsetY + 'px' }" alt=""
-                    draggable="false" @load="measure" />
+                <img ref="imgRef" class="content__img" src="/design.jpg" :style="imgStyle" alt="" draggable="false"
+                    @load="measure" />
 
-                <!-- 随机水波（放 content 内，锚定图片坐标，随图片滚动） -->
+                <!-- 随机水波（锚定图片坐标，随图片滚动） -->
                 <div v-for="d in drops" :key="d.id" class="drop-ring" :style="dropStyle(d)"
                     @animationend="removeDrop(d.id)" />
             </div>
         </div>
 
-        <!-- 常驻涟漪：原点锚在图片 80% × 80% -->
+        <!-- 常驻涟漪：原点锚在图片 80% 宽 × 80% 高 -->
         <div class="ripple-layer" :style="{ opacity: renderH ? 1 : 0 }" aria-hidden="true">
             <div class="ripple-root" :style="originStyle">
                 <div class="ripple-origin" />
@@ -24,7 +24,7 @@
             </div>
         </div>
 
-        <!-- 下一步按钮：挂在「最大圆心」= 原点位置 -->
+        <!-- 下一步按钮：挂在原点 -->
         <button v-show="renderH" class="next-btn" type="button" aria-label="下一步" :style="originStyle" @click="goNext">
             <span class="next-btn__ring" />
             <span class="next-btn__ring next-btn__ring--slow" />
@@ -32,7 +32,7 @@
             <span class="next-btn__dot" />
         </button>
 
-        <!-- 点击涟漪：3 个环依次出现 -->
+        <!-- 点击涟漪 -->
         <div class="click-layer" aria-hidden="true">
             <div v-for="r in rings" :key="r.id" class="click-ring" :style="ringStyle(r)"
                 @animationend="removeRing(r.id)" />
@@ -44,21 +44,66 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 
 /* ===== 可调参数 ===== */
-const lineRatio = 0.9
-const ORIGIN_X = 0.8
-const ORIGIN_Y = 0.8
+const lineRatio = 0.9     // 90% 高度分位线
+const ORIGIN_X = 0.8      // 水波原点：图片宽度的 80%
+const ORIGIN_Y = 0.8      // 水波原点：图片高度的 80%
+const heightRatio = 1     // 图片渲染高度 = 屏幕高 × heightRatio（>1 会更大、可滚动）
 
-/* ===== 尺寸状态 ===== */
+/* ===== 状态 ===== */
 const stageRef = ref(null)
 const scrollerRef = ref(null)
 const imgRef = ref(null)
 
+const stageW = ref(0)
 const stageH = ref(0)
-const renderH = ref(0)
+const natW = ref(0)
+const natH = ref(0)
 const scrollTop = ref(0)
 
 const ratio = Math.min(Math.max(lineRatio, 0), 1)
 
+/** 图片渲染高度（按高度铺满；竖图回退按宽度铺满，避免留白） */
+const renderH = computed(() => {
+    if (!natW.value || !natH.value || !stageH.value || !stageW.value) return 0
+    const aspect = natW.value / natH.value
+
+    // 目标：高度 = 屏幕高 × heightRatio
+    let h = stageH.value * heightRatio
+    let w = h * aspect
+
+    // 如果按高度铺满后宽度还不够屏幕宽（竖图），改为按宽度铺满
+    if (w < stageW.value) {
+        w = stageW.value
+        h = w / aspect
+    }
+    return h
+})
+
+/** 图片渲染宽度 */
+const renderW = computed(() => {
+    if (!renderH.value || !natW.value || !natH.value) return 0
+    return renderH.value * (natW.value / natH.value)
+})
+
+/**
+ * 水平偏移：让图片 80% 宽处尽量对齐屏幕中心，同时保证左右不留空白
+ * - 宽图：理想值 = stageW/2 - 0.8·renderW，夹在 [stageW - renderW, 0] 之间
+ * - 竖图（renderW ≤ stageW）：居中显示
+ */
+const tx = computed(() => {
+    const rw = renderW.value
+    const sw = stageW.value
+    if (!rw || !sw) return 0
+
+    if (rw <= sw) return (sw - rw) / 2
+
+    const ideal = sw / 2 - ORIGIN_X * rw
+    const minTx = sw - rw // 右边缘贴屏幕右
+    const maxTx = 0       // 左边缘贴屏幕左
+    return Math.min(maxTx, Math.max(minTx, ideal))
+})
+
+/** 垂直偏移：分界线不落底；超出则上移裁掉顶部 */
 const offsetY = computed(() => {
     const h = renderH.value
     const H = stageH.value
@@ -67,6 +112,7 @@ const offsetY = computed(() => {
     return lineY > H ? H - lineY : 0
 })
 
+/** 内容区高度 = 图片底边位置（未裁切 = renderH；裁切 = renderH + offsetY） */
 const contentH = computed(() => {
     const h = renderH.value
     const H = stageH.value
@@ -74,10 +120,17 @@ const contentH = computed(() => {
     return h + offsetY.value
 })
 
-/** 原点位置（按钮与常驻涟漪共用） */
+const imgStyle = computed(() => ({
+    left: `${tx.value}px`,
+    top: `${offsetY.value}px`,
+    width: `${renderW.value}px`,
+    height: `${renderH.value}px`
+}))
+
+/** 水波原点在舞台坐标系中的位置 */
 const originStyle = computed(() => ({
-    left: `${ORIGIN_X * 100}%`,
-    top: `${offsetY.value + renderH.value * ORIGIN_Y - scrollTop.value}px`
+    left: `${tx.value + ORIGIN_X * renderW.value}px`,
+    top: `${offsetY.value + ORIGIN_Y * renderH.value - scrollTop.value}px`
 }))
 
 function onScroll() {
@@ -85,14 +138,19 @@ function onScroll() {
 }
 
 function measure() {
-    if (stageRef.value) stageH.value = stageRef.value.clientHeight
-    if (imgRef.value) renderH.value = imgRef.value.offsetHeight
+    if (stageRef.value) {
+        stageW.value = stageRef.value.clientWidth
+        stageH.value = stageRef.value.clientHeight
+    }
+    if (imgRef.value && imgRef.value.naturalWidth) {
+        natW.value = imgRef.value.naturalWidth
+        natH.value = imgRef.value.naturalHeight
+    }
     onScroll()
 }
 
-/* ===== 下一步按钮 ===== */
+/* ===== 下一步 ===== */
 function goNext() {
-    // 跳转首页（SPA 若用 vue-router，可改为 router.push('/')）
     window.location.href = '/'
 }
 
@@ -106,7 +164,6 @@ function onClick(e) {
     const rect = stage.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
-
     for (let i = 0; i < 3; i++) {
         rings.value.push({ id: ++ringSeq, x, y, delay: i * 400 })
     }
@@ -137,9 +194,7 @@ function scheduleDrop() {
 }
 
 function spawnDrops() {
-    const h = renderH.value
-    if (!h) return
-
+    if (!renderH.value) return
     const count = 1 + Math.floor(Math.random() * 3)
     for (let i = 0; i < count; i++) {
         drops.value.push({
@@ -154,8 +209,9 @@ function spawnDrops() {
 
 function dropStyle(d) {
     return {
-        left: `${d.x * 100}%`,
-        top: `${offsetY.value + renderH.value * d.y}px`,
+        // 图片坐标 → 内容坐标（含水平偏移 tx）
+        left: `${tx.value + d.x * renderW.value}px`,
+        top: `${offsetY.value + d.y * renderH.value}px`,
         width: `${d.size}px`,
         height: `${d.size}px`,
         animationDuration: `${d.duration}ms`
@@ -198,8 +254,11 @@ onBeforeUnmount(() => {
     position: relative;
     width: 100%;
     height: 100vh;
+    height: 100dvh;
+    /* 移动端地址栏收缩自适应 */
     overflow: hidden;
     background: #000;
+    overscroll-behavior: none;
 }
 
 .scroller {
@@ -208,6 +267,7 @@ onBeforeUnmount(() => {
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
     scrollbar-width: none;
     -ms-overflow-style: none;
 }
@@ -222,19 +282,19 @@ onBeforeUnmount(() => {
     position: relative;
     width: 100%;
     overflow: hidden;
+    /* 左右裁切、顶部裁切都在这里完成 */
 }
 
 .content__img {
     position: absolute;
-    left: 0;
-    width: 100%;
-    height: auto;
     display: block;
     user-select: none;
     -webkit-user-drag: none;
+    max-width: none;
+    /* 防止被全局样式限制宽度 */
 }
 
-/* ===== 下一步按钮（挂在最大圆心 = 原点） ===== */
+/* ===== 下一步按钮 ===== */
 .next-btn {
     position: absolute;
     z-index: 5;
@@ -251,7 +311,6 @@ onBeforeUnmount(() => {
     outline: none;
 }
 
-/* 外圈提示环：持续向外脉冲，明确「这里可以点」 */
 .next-btn__ring {
     position: absolute;
     inset: 0;
@@ -285,7 +344,6 @@ onBeforeUnmount(() => {
     }
 }
 
-/* 中心能量核 */
 .next-btn__core {
     position: absolute;
     top: 50%;
@@ -303,7 +361,6 @@ onBeforeUnmount(() => {
     pointer-events: none;
 }
 
-/* 中心实心圆点 */
 .next-btn__dot {
     position: absolute;
     top: 50%;
@@ -320,7 +377,6 @@ onBeforeUnmount(() => {
     transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
-/* hover / 键盘聚焦 */
 .next-btn:hover .next-btn__core,
 .next-btn:focus-visible .next-btn__core {
     transform: translate(-50%, -50%) scale(1.16);
@@ -330,22 +386,10 @@ onBeforeUnmount(() => {
 .next-btn:hover .next-btn__dot,
 .next-btn:focus-visible .next-btn__dot {
     transform: translate(-50%, -50%) scale(1.2);
-    box-shadow:
-        0 0 14px rgba(190, 230, 255, 1),
-        0 0 28px rgba(120, 195, 255, 0.7);
-}
-
-.next-btn:hover .next-btn__ring,
-.next-btn:focus-visible .next-btn__ring {
-    border-color: rgba(190, 230, 255, 1);
 }
 
 .next-btn:active .next-btn__core {
     transform: translate(-50%, -50%) scale(0.92);
-}
-
-.next-btn:active .next-btn__dot {
-    transform: translate(-50%, -50%) scale(0.85);
 }
 
 .next-btn:focus-visible {
@@ -395,7 +439,7 @@ onBeforeUnmount(() => {
     }
 }
 
-/* ===== 常驻涟漪层 ===== */
+/* ===== 常驻涟漪 ===== */
 .ripple-layer {
     position: absolute;
     inset: 0;
@@ -533,7 +577,7 @@ onBeforeUnmount(() => {
     }
 }
 
-/* ===== 点击涟漪层 ===== */
+/* ===== 点击涟漪 ===== */
 .click-layer {
     position: absolute;
     inset: 0;
