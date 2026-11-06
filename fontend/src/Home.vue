@@ -5,13 +5,11 @@
                 <img ref="imgRef" class="content__img" src="/design.jpg" :style="imgStyle" alt="" draggable="false"
                     @load="measure" />
 
-                <!-- 随机水波（锚定图片坐标，随图片滚动） -->
                 <div v-for="d in drops" :key="d.id" class="drop-ring" :style="dropStyle(d)"
                     @animationend="removeDrop(d.id)" />
             </div>
         </div>
 
-        <!-- 常驻涟漪：原点锚在图片 80% 宽 × 80% 高 -->
         <div class="ripple-layer" :style="{ opacity: renderH ? 1 : 0 }" aria-hidden="true">
             <div class="ripple-root" :style="originStyle">
                 <div class="ripple-origin" />
@@ -24,7 +22,6 @@
             </div>
         </div>
 
-        <!-- 下一步按钮：挂在原点 -->
         <button v-show="renderH" class="next-btn" type="button" aria-label="下一步" :style="originStyle" @click="goNext">
             <span class="next-btn__ring" />
             <span class="next-btn__ring next-btn__ring--slow" />
@@ -32,24 +29,43 @@
             <span class="next-btn__dot" />
         </button>
 
-        <!-- 点击涟漪 -->
         <div class="click-layer" aria-hidden="true">
             <div v-for="r in rings" :key="r.id" class="click-ring" :style="ringStyle(r)"
                 @animationend="removeRing(r.id)" />
         </div>
+
+        <Transition name="modal-fade">
+            <div v-if="showModal" class="modal" @click.stop.self="closeModal">
+                <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+                    <button class="modal__close" type="button" aria-label="关闭" @click="closeModal">✕</button>
+
+                    <h2 id="modal-title" class="modal__title">继续体验</h2>
+                    <p class="modal__subtitle">选择登录账号，或直接免费试用</p>
+
+                    <div class="modal__actions">
+                        <button class="modal-card" type="button" @click="handleLogin">
+                            <span class="modal-card__title">登录</span>
+                            <span class="modal-card__desc">已有账号，立即进入</span>
+                        </button>
+                        <button class="modal-card" type="button" @click="handleTrial">
+                            <span class="modal-card__title">试用</span>
+                            <span class="modal-card__desc">免费体验，无需注册</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Transition>
     </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 
-/* ===== 可调参数 ===== */
-const lineRatio = 0.9     // 90% 高度分位线
-const ORIGIN_X = 0.8      // 水波原点：图片宽度的 80%
-const ORIGIN_Y = 0.8      // 水波原点：图片高度的 80%
-const heightRatio = 1     // 图片渲染高度 = 屏幕高 × heightRatio（>1 会更大、可滚动）
+const lineRatio = 0.9
+const ORIGIN_X = 0.8
+const ORIGIN_Y = 0.8
+const heightRatio = 1
 
-/* ===== 状态 ===== */
 const stageRef = ref(null)
 const scrollerRef = ref(null)
 const imgRef = ref(null)
@@ -62,16 +78,11 @@ const scrollTop = ref(0)
 
 const ratio = Math.min(Math.max(lineRatio, 0), 1)
 
-/** 图片渲染高度（按高度铺满；竖图回退按宽度铺满，避免留白） */
 const renderH = computed(() => {
     if (!natW.value || !natH.value || !stageH.value || !stageW.value) return 0
     const aspect = natW.value / natH.value
-
-    // 目标：高度 = 屏幕高 × heightRatio
     let h = stageH.value * heightRatio
     let w = h * aspect
-
-    // 如果按高度铺满后宽度还不够屏幕宽（竖图），改为按宽度铺满
     if (w < stageW.value) {
         w = stageW.value
         h = w / aspect
@@ -79,31 +90,22 @@ const renderH = computed(() => {
     return h
 })
 
-/** 图片渲染宽度 */
 const renderW = computed(() => {
     if (!renderH.value || !natW.value || !natH.value) return 0
     return renderH.value * (natW.value / natH.value)
 })
 
-/**
- * 水平偏移：让图片 80% 宽处尽量对齐屏幕中心，同时保证左右不留空白
- * - 宽图：理想值 = stageW/2 - 0.8·renderW，夹在 [stageW - renderW, 0] 之间
- * - 竖图（renderW ≤ stageW）：居中显示
- */
 const tx = computed(() => {
     const rw = renderW.value
     const sw = stageW.value
     if (!rw || !sw) return 0
-
     if (rw <= sw) return (sw - rw) / 2
-
     const ideal = sw / 2 - ORIGIN_X * rw
-    const minTx = sw - rw // 右边缘贴屏幕右
-    const maxTx = 0       // 左边缘贴屏幕左
+    const minTx = sw - rw
+    const maxTx = 0
     return Math.min(maxTx, Math.max(minTx, ideal))
 })
 
-/** 垂直偏移：分界线不落底；超出则上移裁掉顶部 */
 const offsetY = computed(() => {
     const h = renderH.value
     const H = stageH.value
@@ -112,7 +114,6 @@ const offsetY = computed(() => {
     return lineY > H ? H - lineY : 0
 })
 
-/** 内容区高度 = 图片底边位置（未裁切 = renderH；裁切 = renderH + offsetY） */
 const contentH = computed(() => {
     const h = renderH.value
     const H = stageH.value
@@ -127,7 +128,6 @@ const imgStyle = computed(() => ({
     height: `${renderH.value}px`
 }))
 
-/** 水波原点在舞台坐标系中的位置 */
 const originStyle = computed(() => ({
     left: `${tx.value + ORIGIN_X * renderW.value}px`,
     top: `${offsetY.value + ORIGIN_Y * renderH.value - scrollTop.value}px`
@@ -149,12 +149,32 @@ function measure() {
     onScroll()
 }
 
-/* ===== 下一步 ===== */
+const showModal = ref(false)
+
 function goNext() {
-    window.location.href = '/'
+    showModal.value = true
 }
 
-/* ===== 点击涟漪 ===== */
+function closeModal() {
+    showModal.value = false
+}
+
+function handleLogin() {
+    window.location.href = '/login'
+}
+
+function handleTrial() {
+    window.location.href = '/trial'
+}
+
+watch(showModal, (val) => {
+    document.body.style.overflow = val ? 'hidden' : ''
+})
+
+function onKeydown(e) {
+    if (e.key === 'Escape' && showModal.value) closeModal()
+}
+
 const rings = ref([])
 let ringSeq = 0
 
@@ -181,7 +201,6 @@ function removeRing(id) {
     rings.value = rings.value.filter((r) => r.id !== id)
 }
 
-/* ===== 随机水波 ===== */
 const drops = ref([])
 let dropSeq = 0
 let dropTimer = null
@@ -209,7 +228,6 @@ function spawnDrops() {
 
 function dropStyle(d) {
     return {
-        // 图片坐标 → 内容坐标（含水平偏移 tx）
         left: `${tx.value + d.x * renderW.value}px`,
         top: `${offsetY.value + d.y * renderH.value}px`,
         width: `${d.size}px`,
@@ -238,6 +256,7 @@ onMounted(() => {
     if (stageRef.value) ro.observe(stageRef.value)
     window.addEventListener('orientationchange', measure)
     document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('keydown', onKeydown)
     scheduleDrop()
 })
 
@@ -246,6 +265,8 @@ onBeforeUnmount(() => {
     clearTimeout(dropTimer)
     window.removeEventListener('orientationchange', measure)
     document.removeEventListener('visibilitychange', onVisibility)
+    window.removeEventListener('keydown', onKeydown)
+    document.body.style.overflow = ''
 })
 </script>
 
@@ -255,7 +276,6 @@ onBeforeUnmount(() => {
     width: 100%;
     height: 100vh;
     height: 100dvh;
-    /* 移动端地址栏收缩自适应 */
     overflow: hidden;
     background: #000;
     overscroll-behavior: none;
@@ -282,7 +302,6 @@ onBeforeUnmount(() => {
     position: relative;
     width: 100%;
     overflow: hidden;
-    /* 左右裁切、顶部裁切都在这里完成 */
 }
 
 .content__img {
@@ -291,7 +310,6 @@ onBeforeUnmount(() => {
     user-select: none;
     -webkit-user-drag: none;
     max-width: none;
-    /* 防止被全局样式限制宽度 */
 }
 
 /* ===== 下一步按钮 ===== */
@@ -357,7 +375,7 @@ onBeforeUnmount(() => {
             rgba(90, 165, 235, 0.65) 55%,
             transparent 78%);
     box-shadow: 0 0 16px rgba(120, 195, 255, 0.75);
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    transition: box-shadow 0.2s ease;
     pointer-events: none;
 }
 
@@ -374,22 +392,17 @@ onBeforeUnmount(() => {
         0 0 20px rgba(120, 195, 255, 0.45);
     transform: translate(-50%, -50%);
     pointer-events: none;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    transition: box-shadow 0.2s ease;
 }
 
 .next-btn:hover .next-btn__core,
 .next-btn:focus-visible .next-btn__core {
-    transform: translate(-50%, -50%) scale(1.16);
     box-shadow: 0 0 26px rgba(150, 210, 255, 0.98);
 }
 
-.next-btn:hover .next-btn__dot,
-.next-btn:focus-visible .next-btn__dot {
-    transform: translate(-50%, -50%) scale(1.2);
-}
-
-.next-btn:active .next-btn__core {
-    transform: translate(-50%, -50%) scale(0.92);
+.next-btn:hover .next-btn__ring,
+.next-btn:focus-visible .next-btn__ring {
+    border-color: rgba(190, 230, 255, 1);
 }
 
 .next-btn:focus-visible {
@@ -629,6 +642,178 @@ onBeforeUnmount(() => {
         opacity: 0;
         border-color: rgba(102, 179, 255, 0);
         border-width: 0.25px;
+    }
+}
+
+/* ===== 全屏磨砂模态框 ===== */
+.modal {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(8, 22, 45, 0.6);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    backdrop-filter: blur(20px) saturate(140%);
+}
+
+.modal__panel {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    padding: 32px 28px 28px;
+    border-radius: 20px;
+    background: rgba(22, 48, 88, 0.55);
+    border: 1px solid rgba(102, 179, 255, 0.35);
+    box-shadow:
+        0 20px 60px rgba(0, 0, 0, 0.5),
+        0 0 30px rgba(102, 179, 255, 0.12),
+        inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    text-align: center;
+}
+
+.modal__close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 36px;
+    height: 36px;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(102, 179, 255, 0.12);
+    color: rgba(200, 225, 255, 0.9);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s ease, color 0.2s ease;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.modal__close:hover,
+.modal__close:focus-visible {
+    background: rgba(102, 179, 255, 0.25);
+    color: #fff;
+    outline: none;
+}
+
+.modal__title {
+    margin: 4px 0 6px;
+    font-size: 22px;
+    font-weight: 600;
+    color: rgba(235, 247, 255, 0.98);
+    letter-spacing: 0.5px;
+}
+
+.modal__subtitle {
+    margin: 0 0 24px;
+    font-size: 14px;
+    color: rgba(175, 215, 250, 0.78);
+}
+
+/* 移动端：上下排列 */
+.modal__actions {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+/* 两个入口完全同一套视觉 */
+.modal-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 18px 20px;
+    border-radius: 14px;
+    border: 1px solid rgba(102, 179, 255, 0.4);
+    background: rgba(35, 78, 140, 0.45);
+    color: rgba(235, 247, 255, 0.98);
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition:
+        border-color 0.2s ease,
+        background 0.2s ease,
+        box-shadow 0.2s ease;
+    outline: none;
+}
+
+.modal-card:hover,
+.modal-card:focus-visible {
+    border-color: rgba(130, 195, 255, 0.85);
+    background: rgba(50, 100, 175, 0.55);
+    box-shadow: 0 8px 24px rgba(102, 179, 255, 0.22);
+}
+
+.modal-card__title {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+.modal-card__desc {
+    font-size: 13px;
+    color: rgba(175, 215, 250, 0.75);
+}
+
+/* 桌面端：左右排列 */
+@media (min-width: 641px) {
+    .modal__actions {
+        flex-direction: row;
+        gap: 16px;
+    }
+
+    .modal-card {
+        flex: 1;
+        min-width: 0;
+        padding: 22px 22px;
+    }
+}
+
+/* 入场/退场：淡入 + 轻微缩放 */
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+    transition: opacity 0.25s ease;
+}
+
+.modal-fade-enter-active .modal__panel,
+.modal-fade-leave-active .modal__panel {
+    transition:
+        transform 0.3s ease,
+        opacity 0.25s ease;
+}
+
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+    opacity: 0;
+}
+
+.modal-fade-enter-from .modal__panel,
+.modal-fade-leave-to .modal__panel {
+    opacity: 0;
+    transform: scale(0.97);
+}
+
+/* 移动端适配 */
+@media (max-width: 480px) {
+    .modal {
+        padding: 16px;
+    }
+
+    .modal__panel {
+        padding: 28px 20px 22px;
+        border-radius: 18px;
+    }
+
+    .modal__title {
+        font-size: 20px;
     }
 }
 </style>

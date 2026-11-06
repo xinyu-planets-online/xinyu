@@ -28,6 +28,7 @@ import { useTtsSettings } from './composables/useTtsSettings'
 const SELECTION_KEY = 'chat-selection'
 const MODELS_KEY = 'chat-models'
 const OCR_ENABLED_KEY = 'chat-ocr-enabled'
+const SIDEBAR_COLLAPSED_KEY = 'chat-sidebar-collapsed'
 
 const {
   themeLabel, themeMode, resolvedTheme, cycleTheme,
@@ -58,6 +59,19 @@ function previewTts() {
   }
   tts.speak('你好，这是一段试听语音。', { emotion: 'happy', weight: 0.6, lang: 'ZH' }, s.voice)
 }
+
+// ===== 左侧侧栏收起状态 =====
+const sidebarCollapsed = ref(false)
+try {
+  sidebarCollapsed.value = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+} catch { }
+
+watch(sidebarCollapsed, (v) => {
+  try {
+    if (v) localStorage.setItem(SIDEBAR_COLLAPSED_KEY, '1')
+    else localStorage.removeItem(SIDEBAR_COLLAPSED_KEY)
+  } catch { }
+})
 
 const ocrEnabled = ref(false)
 try {
@@ -289,9 +303,6 @@ async function buildPayload({ files }) {
 }
 
 // ===== TTS 句子级流水线 =====
-// 策略：等到 <TTS> 头部闭合、解析出 emotion/weight/lang 后，再开始处理正文。
-// stripTtsMarkers 对未闭合头部的剥离天然保证头部闭合前 visible 为空，
-// 所以这里只需要在每次 onDelta 开头尝试解析 meta 即可。
 const SENTENCE_END = /[。！？!?\n]/
 const TTS_META_RE = /<TTS>\s*(\{[\s\S]*?\})\s*<\/TTS>/i
 const EMOTION_KEYS = ['happy', 'angry', 'sad', 'fear', 'disgust', 'low', 'surprised', 'calm']
@@ -304,13 +315,6 @@ function normalizeMeta(p) {
   const weight = Math.max(0, Math.min(1, rawWeight))
   const lang = typeof p.lang === 'string' && p.lang ? p.lang : FALLBACK_META.lang
   return { emotion, weight, lang }
-}
-
-function buildVector(emotion, weight) {
-  const v = {}
-  for (const k of EMOTION_KEYS) v[k] = 0
-  if (emotion in v) v[emotion] = weight
-  return v
 }
 
 function splitSentences(buffer, flush) {
@@ -432,7 +436,6 @@ function createTtsPipeline(voice) {
   }
 }
 
-// 用不上，保留以防其他地方引用
 function playAssistantTts() { }
 
 function buildTtsPipelineFor(ttsActive) {
@@ -732,11 +735,27 @@ onUnmounted(() => {
     </transition>
 
     <div class="body">
-      <ConversationSidebar :conversations="conversations" :active-conversation-id="activeConversationId"
-        :select-mode="selectMode" :selected-ids="selectedIds" @switch="switchConversation" @close="closeConversation"
-        @create="createConversation" @export-all="exportAllConversations" @enter-select="enterSelectMode"
-        @import="handleImport" @toggle-select="toggleSelect" @toggle-select-all="toggleSelectAll"
-        @export-selected="exportSelected" @cancel-select="cancelSelectMode" />
+      <div class="sidebar-wrap" :class="{ collapsed: sidebarCollapsed }">
+        <ConversationSidebar :conversations="conversations" :active-conversation-id="activeConversationId"
+          :select-mode="selectMode" :selected-ids="selectedIds" @switch="switchConversation" @close="closeConversation"
+          @create="createConversation" @export-all="exportAllConversations" @enter-select="enterSelectMode"
+          @import="handleImport" @toggle-select="toggleSelect" @toggle-select-all="toggleSelectAll"
+          @export-selected="exportSelected" @cancel-select="cancelSelectMode" />
+      </div>
+
+      <div class="sidebar-toggle-bar">
+        <button class="sidebar-fab" :title="sidebarCollapsed ? '展开对话列表' : '收起对话列表'"
+          @click="sidebarCollapsed = !sidebarCollapsed">
+          <svg v-if="sidebarCollapsed" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M6 3L11 8L6 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg>
+          <svg v-else viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M10 3L5 8L10 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
 
       <main class="chat-area">
         <div v-if="!currentProvider" class="hint"><span>先选一个模型，再开始对话</span><button class="hint-btn"
@@ -744,8 +763,8 @@ onUnmounted(() => {
 
         <div ref="chatWrapper" class="chat-card">
           <ChatContainer :messages="displayMessages" :preset-questions="presetQuestions" :theme="resolvedTheme"
-            welcome-logo="/favicon.ico" assistantName="助手" welcome-title="你好，有什么可以帮你？"
-            welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/favicon.ico" @send="onSend"
+            welcome-logo="/logo.png" assistantName="心屿" welcome-title="你好，有什么可以帮你？"
+            welcome-description="试着问我任何问题，或选择下方的话题开始对话。" assistantAvatar="/logo.png" @send="onSend"
             @select="onPresetSelect" />
 
           <div class="chat-toolbar">
@@ -870,6 +889,97 @@ onUnmounted(() => {
   min-height: 0;
   min-width: 0;
   display: flex;
+}
+
+.mindfulness-entry {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  padding: 0.5rem 1rem 0;
+}
+
+.mindfulness-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 2rem;
+  padding: 0 0.875rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  color: var(--acu-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999rem;
+  text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.mindfulness-link svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.mindfulness-link:hover,
+.mindfulness-link:focus-visible {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+  outline: none;
+}
+
+/* ===== 侧栏收起包装（无过渡） ===== */
+.sidebar-wrap {
+  flex: 0 0 auto;
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.sidebar-wrap.collapsed {
+  width: 0;
+}
+
+.sidebar-wrap>* {
+  flex: 0 0 auto;
+}
+
+/* ===== 侧栏切换条：flex 流内占位，不覆盖任何内容 ===== */
+.sidebar-toggle-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 3.75rem;
+  width: 1.5rem;
+}
+
+.sidebar-fab {
+  width: 1.5rem;
+  height: 1.75rem;
+  display: grid;
+  place-items: center;
+  color: var(--acu-text-muted);
+  background: transparent;
+  border: 1px solid var(--acu-border);
+  border-radius: 0.375rem;
+  cursor: pointer;
+}
+
+.sidebar-fab svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.sidebar-fab:hover {
+  color: var(--acu-primary);
+  background: var(--acu-primary-soft);
+  border-color: var(--acu-primary-soft);
+}
+
+.sidebar-fab:focus-visible {
+  outline: 2px solid var(--acu-primary);
+  outline-offset: 2px;
 }
 
 .chat-area {
@@ -1184,6 +1294,16 @@ onUnmounted(() => {
 @media (max-width: 48rem) {
   .body {
     flex-direction: column;
+  }
+
+  .sidebar-wrap,
+  .sidebar-wrap.collapsed {
+    width: 100%;
+    max-height: 7.5rem;
+  }
+
+  .sidebar-toggle-bar {
+    display: none;
   }
 
   .chat-area {
