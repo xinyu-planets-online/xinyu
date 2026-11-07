@@ -14,6 +14,7 @@ import ConversationTree from './components/ConversationTree.vue'
 import EditMessageDialog from './components/EditMessageDialog.vue'
 import VoiceInputButton from './components/VoiceInputButton.vue'
 import ImageViewer from './components/ImageViewer.vue'
+import EnergyStation from './components/EnergyStation.vue'
 
 import { useTheme } from './composables/useTheme'
 import { useNotice } from './composables/useNotice'
@@ -90,6 +91,7 @@ const showTree = ref(false)
 const currentProvider = ref('')
 const currentModel = ref('')
 const settingsRef = ref(null)
+const showEnergy = ref(false)
 
 const voiceBaseText = ref('')
 const models = ref([])
@@ -728,7 +730,7 @@ onUnmounted(() => {
 <template>
   <div class="page" :data-theme="resolvedTheme">
     <AppHeader :theme-label="themeLabel" :show-settings="showSettings" @cycle-theme="cycleTheme"
-      @toggle-settings="showSettings = !showSettings" />
+      @toggle-settings="showSettings = !showSettings" @open-energy="showEnergy = true" />
 
     <transition name="fade">
       <div v-if="notice" class="notice">{{ notice }}</div>
@@ -833,7 +835,7 @@ onUnmounted(() => {
 
     <ImageViewer :visible="imageViewerVisible" :src="imageViewerSrc" alt="图片预览"
       @close="imageViewerVisible = false; imageViewerSrc = ''" />
-
+    <EnergyStation :visible="showEnergy" @close="showEnergy = false" />
     <SettingsDrawer ref="settingsRef" :show-settings="showSettings" :current-provider="currentProvider"
       :current-model="currentModel" :models="models" :theme-mode="themeMode" :user-system-prompt="userSystemPrompt"
       :tts-settings="ttsSettings" @close="showSettings = false" @update:theme-mode="themeMode = $event"

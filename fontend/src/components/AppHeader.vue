@@ -3,7 +3,7 @@ defineProps({
     themeLabel: { type: String, required: true },
     showSettings: { type: Boolean, default: false },
 })
-defineEmits(['cycle-theme', 'toggle-settings'])
+defineEmits(['cycle-theme', 'toggle-settings', 'open-energy'])
 </script>
 
 <template>
@@ -22,6 +22,14 @@ defineEmits(['cycle-theme', 'toggle-settings'])
                     <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.2" opacity="0.28" />
                 </svg>
                 <span>正念呼吸</span>
+            </a>
+            <a class="pill-btn pill-btn--energy" href="javascript:void(0)" role="button" title="今日能量站"
+                @click="$emit('open-energy')">
+                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 1.5l1.4 4.1 4.1 1.4-4.1 1.4L8 12.5 6.6 8.4 2.5 7l4.1-1.4L8 1.5z" stroke="currentColor"
+                        stroke-width="1.2" stroke-linejoin="round" />
+                </svg>
+                <span>今日能量站</span>
             </a>
         </nav>
 
@@ -90,6 +98,7 @@ defineEmits(['cycle-theme', 'toggle-settings'])
     flex: 1 1 auto;
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: clamp(0.375rem, 0.8vw, 0.5rem);
     min-width: 0;
 }
@@ -124,6 +133,25 @@ defineEmits(['cycle-theme', 'toggle-settings'])
     width: 0.875rem;
     height: 0.875rem;
     flex: 0 0 auto;
+}
+
+.pill-btn--energy {
+    color: var(--acu-text);
+}
+
+.pill-btn--energy svg {
+    color: var(--acu-primary);
+}
+
+@media (max-width: 48rem) {
+    .pill-btn--energy span {
+        display: none;
+    }
+
+    .pill-btn--energy::after {
+        content: "能量";
+        margin-left: 0.25rem;
+    }
 }
 
 .pill-btn:hover,
