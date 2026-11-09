@@ -484,6 +484,13 @@ async function onSend({ text, files }) {
     ttsPipeline,
   })
 
+  if (result && !result.ok && result.isQuotaError) {
+    ttsPipeline?.stop()
+    showSettings.value = true
+    showNotice('当前模型配额已用尽，请到设置里添加或切换模型')
+    return
+  }
+
   if (result && !result.ok && result.isImageError && !useOcr) {
     ttsPipeline?.stop()
     ocrEnabled.value = true
@@ -544,7 +551,7 @@ async function onEditMessage({ nodeId, content }) {
     : userSystemPrompt.value
   const ttsPipeline = buildTtsPipelineFor(ttsActive)
 
-  await chatStream.generateAssistant({
+  const result = await chatStream.generateAssistant({
     userNodeId: newNode.id,
     provider: currentProvider.value,
     model: currentModel.value,
@@ -553,6 +560,12 @@ async function onEditMessage({ nodeId, content }) {
     userSystemPrompt: finalSystemPrompt,
     ttsPipeline,
   })
+
+  if (result && !result.ok && result.isQuotaError) {
+    ttsPipeline?.stop()
+    showSettings.value = true
+    showNotice('当前模型配额已用尽，请到设置里添加或切换模型')
+  }
 }
 
 async function onRegenerate(nodeId) {
@@ -580,6 +593,13 @@ async function onRegenerate(nodeId) {
     userSystemPrompt: finalSystemPrompt,
     ttsPipeline,
   })
+
+  if (result && !result.ok && result.isQuotaError) {
+    ttsPipeline?.stop()
+    showSettings.value = true
+    showNotice('当前模型配额已用尽，请到设置里添加或切换模型')
+    return
+  }
 
   if (result && !result.ok && result.isImageError && !ocrEnabled.value) {
     ttsPipeline?.stop()
@@ -870,12 +890,13 @@ onUnmounted(() => {
   --glow-c: rgba(36, 46, 60, 0.4);
 }
 
+/* ===== 提示条：层级高于所有模态框（设置 100 / 图片预览 200 / 登录 200），保证随时可见 ===== */
 .notice {
   position: fixed;
   top: clamp(3.25rem, 8vh, 4.25rem);
   left: 50%;
   transform: translateX(-50%);
-  z-index: 60;
+  z-index: 300;
   padding: clamp(0.5rem, 1.2vh, 0.625rem) clamp(0.875rem, 1.6vw, 1.125rem);
   font-size: clamp(0.75rem, 0.7rem + 0.15vw, 0.8125rem);
   color: var(--acu-text);

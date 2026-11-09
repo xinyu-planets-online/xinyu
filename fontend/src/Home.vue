@@ -66,6 +66,8 @@ const ORIGIN_X = 0.8
 const ORIGIN_Y = 0.8
 const heightRatio = 1
 
+const OEMCHAT_KEY_APPLIED = 'oemchat-key-applied'
+
 const stageRef = ref(null)
 const scrollerRef = ref(null)
 const imgRef = ref(null)
@@ -163,7 +165,19 @@ function handleLogin() {
     window.location.href = '/#login'
 }
 
-function handleTrial() {
+async function handleTrial() {
+    // 只申请一次：若本机已申请过，就不再重复向服务器要 key
+    try {
+        if (!localStorage.getItem(OEMCHAT_KEY_APPLIED)) {
+            const r = await fetch('/oemchat/apply', { credentials: 'include' })
+            if (r.ok) {
+                try { localStorage.setItem(OEMCHAT_KEY_APPLIED, '1') } catch { }
+            }
+        }
+    } catch (e) {
+        // 拿不到 key 也放行，用户进入后再决定
+        console.warn('[oemchat] 申请试用 key 失败', e)
+    }
     window.location.href = '/#trial'
 }
 

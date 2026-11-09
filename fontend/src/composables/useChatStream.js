@@ -10,6 +10,15 @@ function isImageUnsupportedError(err) {
     return false
 }
 
+function isQuotaError(err) {
+    const msg = String(err?.message || err || '').toLowerCase()
+    if (!msg) return false
+    if (msg.includes('429')) return true
+    if (msg.includes('quota exceeded') || msg.includes('quota_exceeded')) return true
+    if (msg.includes('配额已用尽') || msg.includes('配额耗尽')) return true
+    return false
+}
+
 export function useChatStream({ addNode }) {
     const streaming = useStreaming()
 
@@ -105,6 +114,7 @@ export function useChatStream({ addNode }) {
             return { ok: true, assistantId: assistant.id }
         } catch (err) {
             const isImageError = isImageUnsupportedError(err)
+            const isQuotaErr = !isImageError && isQuotaError(err)
             if (ttsPipeline && typeof ttsPipeline.onError === 'function') {
                 ttsPipeline.onError()
             } else if (fullText) {
@@ -114,10 +124,19 @@ export function useChatStream({ addNode }) {
                 type: 'error',
                 delta: isImageError
                     ? '当前模型不支持图片输入。开启 OCR 后会改用图片中的文字重发。'
-                    : (err?.message || '请求失败'),
+                    : isQuotaErr
+                        ? '当前模型配额已用尽，请到设置里添加或切换模型。'
+                        : (err?.message || '请求失败'),
             })
             assistant.isImageUnsupported = isImageError
-            return { ok: false, isImageError, error: err, assistantId: assistant.id }
+            assistant.isQuotaExceeded = isQuotaErr
+            return {
+                ok: false,
+                isImageError,
+                isQuotaError: isQuotaErr,
+                error: err,
+                assistantId: assistant.id,
+            }
         } finally {
             await putMessage({ ...assistant, conversationId: conversation.id })
             await putConversation(conversation)

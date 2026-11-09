@@ -73,6 +73,9 @@ const BUILTIN_MODELS = {
 const NO_KEY_REQUIRED = ['ollama', 'lmstudio', 'localai']
 
 const CUSTOM_ENDPOINTS_STORAGE_KEY = 'llm-hub-custom-endpoints'
+const OEMCHAT_ENDPOINT_NAME = 'oemchat'
+const OEMCHAT_KEY_APPLIED = 'oemchat-key-applied'
+const OEMCHAT_DISPLAY_NAME = 'OEM Chat 试用'
 
 function loadCustomEndpoints() {
     try {
@@ -128,8 +131,72 @@ async function buildClient() {
     clientRef.value = newClient
 }
 
+async function autoAddOemChatEndpoint() {
+    // 已有可用 model 就不再折腾，避免每次打开设置都请求
+    const existing = customEndpoints.value.find(e => e.name === OEMCHAT_ENDPOINT_NAME)
+    if (existing?.model) return
+
+    const baseURL = `${location.origin}/oemchat/v1`
+    let model = ''
+
+    try {
+        let res = await fetch(`${baseURL}/models`, { credentials: 'include' })
+        if (res.status === 401 && !localStorage.getItem(OEMCHAT_KEY_APPLIED)) {
+            // 只在从未申请过时申请一次；过期/耗尽交给用户自己处理
+            await fetch('/oemchat/apply', { credentials: 'include' }).catch(() => { })
+            try { localStorage.setItem(OEMCHAT_KEY_APPLIED, '1') } catch { }
+            res = await fetch(`${baseURL}/models`, { credentials: 'include' })
+        }
+        if (res.ok) {
+            const data = await res.json().catch(() => null)
+            const list = (data?.data || []).map(m => m.id).filter(Boolean)
+            if (list.length) model = list[0]
+        }
+    } catch (e) {
+        console.warn('[oemchat] 拉取模型失败', e)
+    }
+
+    // 端点已存在：只尝试补全 model
+    if (existing) {
+        if (!model) return
+        existing.model = model
+        persistCustomEndpoints()
+        await buildClient()
+        emit('add-model', {
+            provider: existing.name,
+            displayName: existing.displayName || OEMCHAT_DISPLAY_NAME,
+            model,
+            label: existing.displayName || OEMCHAT_DISPLAY_NAME,
+        })
+        return
+    }
+
+    // 新建端点（即使拉取失败也写入，便于用户在设置里手动「拉取模型」）
+    const endpoint = {
+        name: OEMCHAT_ENDPOINT_NAME,
+        displayName: OEMCHAT_DISPLAY_NAME,
+        baseURL,
+        apiKey: '',
+        protocol: 'openai',
+        model: model || '',
+    }
+    customEndpoints.value.push(endpoint)
+    persistCustomEndpoints()
+    await buildClient()
+
+    if (model) {
+        emit('add-model', {
+            provider: endpoint.name,
+            displayName: endpoint.displayName,
+            model,
+            label: endpoint.displayName,
+        })
+    }
+}
+
 onMounted(async () => {
     await buildClient()
+    await autoAddOemChatEndpoint()
 })
 
 function getClient() { return clientRef.value }
@@ -203,6 +270,7 @@ async function fetchCustomModels() {
     remoteModels.value = []
     try {
         const res = await fetch(`${baseURL}/models`, {
+            credentials: 'include',
             headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
         })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -421,6 +489,7 @@ async function testCurrent() {
         const path = protocol === 'anthropic' ? '/messages' : '/chat/completions'
         const res = await fetch(`${baseURL}${path}`, {
             method: 'POST',
+            credentials: 'include',
             headers: {
                 'Content-Type': 'application/json',
                 ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -973,7 +1042,8 @@ async function confirmWipeLocal() {
                                                 <span class="custom-endpoint-name">{{ ep.displayName || ep.name
                                                 }}</span>
                                                 <span class="custom-endpoint-url">{{ ep.baseURL }}</span>
-                                                <span class="custom-endpoint-model">{{ ep.model }}</span>
+                                                <span class="custom-endpoint-model">{{ ep.model || '（未指定模型）'
+                                                }}</span>
                                             </div>
                                             <div class="custom-endpoint-actions">
                                                 <button class="icon-btn" title="编辑"
