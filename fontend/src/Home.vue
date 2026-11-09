@@ -160,11 +160,11 @@ function closeModal() {
 }
 
 function handleLogin() {
-    window.location.href = '/login'
+    window.location.href = '/#login'
 }
 
 function handleTrial() {
-    window.location.href = '/trial'
+    window.location.href = '/#trial'
 }
 
 watch(showModal, (val) => {

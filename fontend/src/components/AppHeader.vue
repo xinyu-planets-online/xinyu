@@ -15,7 +15,7 @@ defineEmits(['cycle-theme', 'toggle-settings', 'open-energy'])
         </div>
 
         <nav class="nav" aria-label="功能导航">
-            <a class="pill-btn pill-btn--mind" href="/mindfulness" title="正念呼吸安抚">
+            <a class="pill-btn pill-btn--mind" href="#mindfulness" title="正念呼吸安抚">
                 <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
                     <circle cx="8" cy="8" r="1.5" fill="currentColor" />
                     <circle cx="8" cy="8" r="4" stroke="currentColor" stroke-width="1.2" opacity="0.55" />

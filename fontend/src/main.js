@@ -4,16 +4,26 @@ import { createPinia } from 'pinia'
 import App from './App.vue'
 import Home from './Home.vue'
 import Mindfulness from './Mindfulness.vue'
-import router from './router'
 
-const path = location.pathname
-const isHome = path === '/home'
-const isMindful = path === '/mindfulness'
+function resolveRoot() {
+    const seg = location.hash.replace(/^#\/?/, '').replace(/\/+$/, '')
+    if (seg === 'home') return Home
+    if (seg === 'mindfulness') return Mindfulness
+    return App
+}
 
-const Root = isHome ? Home : isMindful ? Mindfulness : App
-const app = createApp(Root)
+let app = null
 
-app.use(createPinia())
-app.use(router)
+function mount() {
+    if (app) {
+        app.unmount()
+        app = null
+    }
+    app = createApp(resolveRoot())
+    app.use(createPinia())
+    app.mount('#app')
+}
 
-app.mount('#app')
+mount()
+
+window.addEventListener('hashchange', mount)
