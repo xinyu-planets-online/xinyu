@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { useVoiceInput } from '@/composables/useVoiceInput'
 
 const props = defineProps({
@@ -8,29 +8,118 @@ const props = defineProps({
 })
 const emit = defineEmits(['update', 'finish', 'cancel'])
 
-const active = ref(false)
+const HOLD_MS = 250
+
+const active = ref(false)       // 是否在录音（UI 用）
+const locked = ref(false)       // 是否处于"单击开启"的锁定态
+
+let pressAt = 0                 // 本次 pointerdown 时间
+let downWasActive = false       // pointerdown 时是否已处于录音中（用于判断"再点一下关闭"）
 
 const voice = useVoiceInput({
     lang: 'zh-CN',
     onFinalText: (text) => {
         emit('finish', text)
-        active.value = false
     },
 })
 
-function toggle() {
+function startRecording() {
+    locked.value = false
+    pressAt = performance.now()
+    voice.begin(props.baseText || '')
+    active.value = true
+}
+
+function finishRecording() {
+    active.value = false
+    locked.value = false
+    voice.finish()
+}
+
+function cancelRecording() {
+    active.value = false
+    locked.value = false
+    voice.cancel()
+    emit('cancel')
+}
+
+function onPointerDown(e) {
+    if (props.disabled) return
     if (!voice.isSupported.value) {
         alert('当前浏览器不支持语音输入，请使用 Chrome 或 Edge。')
         return
     }
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+
+    try { e.currentTarget.setPointerCapture?.(e.pointerId) } catch { }
 
     if (active.value) {
-        active.value = false
-        voice.finish()
-    } else {
-        active.value = true
-        voice.begin(props.baseText)
+        // 已在录音（说明是锁定态），记录这次 down 用于 pointerup 关闭
+        downWasActive = true
+        return
     }
+
+    downWasActive = false
+    startRecording()
+}
+
+function onPointerUp(e) {
+    if (!active.value) return
+    try { e.currentTarget.releasePointerCapture?.(e.pointerId) } catch { }
+
+    if (downWasActive) {
+        // 锁定态下再次点击 → 关闭
+        downWasActive = false
+        finishRecording()
+        return
+    }
+
+    const held = performance.now() - pressAt
+    if (held < HOLD_MS) {
+        // 短按 → 进入锁定态（单击开启）
+        locked.value = true
+    } else {
+        // 长按松开（PTT）→ 结束
+        finishRecording()
+    }
+}
+
+function onPointerCancel() {
+    if (!active.value) return
+    if (downWasActive) {
+        // 取消这次"关闭"意图，保持原录音
+        downWasActive = false
+        return
+    }
+    // holding 状态被系统取消 → 结束
+    finishRecording()
+}
+
+function onContextMenu(e) {
+    if (active.value) e.preventDefault()
+}
+
+function onKeyDown(e) {
+    if (e.key !== ' ' && e.key !== 'Enter') return
+    if (e.repeat) return
+    if (props.disabled) return
+    if (!voice.isSupported.value) return
+    e.preventDefault()
+    if (active.value && locked.value) {
+        finishRecording()
+        return
+    }
+    if (!active.value) {
+        startRecording()
+    }
+}
+
+function onKeyUp(e) {
+    if (e.key !== ' ' && e.key !== 'Enter') return
+    if (!active.value) return
+    e.preventDefault()
+    // 键盘始终按 PTT 处理
+    if (!locked.value) finishRecording()
 }
 
 // 实时预览推给父组件
@@ -41,21 +130,30 @@ watch(
     }
 )
 
+// 出错时自动清理，不提交
 watch(
     () => voice.errorMessage.value,
     (msg) => {
-        if (msg) {
-            emit('cancel')
-            active.value = false
+        if (msg && active.value) {
+            cancelRecording()
         }
     }
 )
+
+onBeforeUnmount(() => {
+    if (active.value) cancelRecording()
+})
 </script>
 
 <template>
     <div class="voice-wrap">
-        <button class="voice-btn" :class="{ active, unsupported: !voice.isSupported.value }" :disabled="disabled"
-            :title="voice.isSupported.value ? (active ? '结束语音输入' : '语音输入') : '当前浏览器不支持语音输入'" @click="toggle">
+        <button class="voice-btn" :class="{ active, locked, unsupported: !voice.isSupported.value }"
+            :disabled="disabled" :title="voice.isSupported.value
+                ? (active
+                    ? (locked ? '点击结束录音' : '松开结束，或轻点保持录音')
+                    : '按住说话，或点击开始')
+                : '当前浏览器不支持语音输入'" @pointerdown="onPointerDown" @pointerup="onPointerUp"
+            @pointercancel="onPointerCancel" @contextmenu="onContextMenu" @keydown="onKeyDown" @keyup="onKeyUp">
             <svg v-if="!active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                 stroke-linecap="round" stroke-linejoin="round">
                 <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
@@ -89,7 +187,10 @@ watch(
     border: 1px solid var(--acu-border);
     border-radius: 0.5rem;
     cursor: pointer;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    touch-action: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .voice-btn svg {
@@ -109,9 +210,18 @@ watch(
     border-color: var(--acu-primary);
 }
 
+.voice-btn.active.locked {
+    box-shadow: 0 0 0 3px var(--acu-primary-soft);
+}
+
 .voice-btn.unsupported {
     opacity: 0.35;
     cursor: not-allowed;
+}
+
+.voice-btn:focus-visible {
+    outline: 2px solid var(--acu-primary);
+    outline-offset: 2px;
 }
 
 .pulse {
@@ -144,5 +254,15 @@ watch(
     max-width: 10rem;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .pulse {
+        animation: none;
+    }
+
+    .voice-btn {
+        transition: none;
+    }
 }
 </style>
