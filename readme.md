@@ -29,7 +29,7 @@ pnpm i
 ```
 pnpm dev
 ```
-> [!WARNING] 警告
+> [!WARNING]
 > 本页面**仅提供前端预览呈现**，完整功能请使用在线服务：<https://心屿.planets-online.com/#home>
 
 
